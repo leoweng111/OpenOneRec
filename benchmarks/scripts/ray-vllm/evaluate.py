@@ -1,3 +1,18 @@
+"""RecIF-Bench 评测的正式入口脚本（由 `eval_script.sh` 调用）。
+
+流程：
+    1) HfArgumentParser 解析 6 组 dataclass 参数（模型/基础设施/推理/生成/prompt/benchmark）。
+    2) 构造 Benchmark 对象 —— 传入 model_path 用于 tokenizer + 待评测任务集合。
+    3) 构造 RayVllmGenerator —— 用 Ray + vLLM 起分布式推理集群；tensor_parallel_size 决定 TP 分片，
+        num_gpus 决定总卡数；支持多节点。
+    4) benchmark.run(generator, ...) → 每个 task 走一次 generation_runner，
+        num_return_sequences 决定每个 prompt 生成多少条候选（推荐类任务默认 128）。
+    5) 生成完释放 vLLM 显存，脚本外面再调 `eval_dev_results.py` 计算指标。
+
+关键并行方式：Ray 起若干 vllm worker，每个 worker 拿到一批 prompt 独立生成；
+    多 GPU 用 tensor_parallel_size 切模型，多节点用 --ray_address 连集群。
+"""
+
 from transformers import HfArgumentParser
 import torch
 

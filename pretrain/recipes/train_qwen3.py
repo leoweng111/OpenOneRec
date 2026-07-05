@@ -1,7 +1,37 @@
-"""Qwen3 Training Script
+"""Qwen3 训练主脚本（Pretrain / Stage1 / Stage2 / SFT 通用入口）。
 
-Multi-node, multi-GPU training script for Qwen3 models using FSDP (Fully Sharded Data Parallel).
-Supports distributed training, checkpointing, and comprehensive monitoring.
+功能：使用 FSDP（Fully Sharded Data Parallel）在多节点多 GPU 上训练/微调
+    OneRec 的 Qwen3 因果语言模型。同一份脚本通过参数区分三个训练阶段：
+      * Stage 1（Itemic-Text Alignment）：加 `--freeze_llm` 且
+            `--start_optimize_embedding_index 151669`（即 Itemic Token 的起始 id）
+            → 只优化新加入 Itemic Token 的 embedding，其他 LLM 参数冻结。
+      * Stage 2（Full-parameter Co-Pretraining）：不加 --freeze_llm，全参数训练；
+            数据是"推荐数据 + 通用文本"混合。
+      * SFT（Post-training Stage 1）：加载 Stage 2 权重，全参数继续训，
+            数据换成指令数据（含 chat 模板），且 `only_assistant_loss=True`
+            使得 loss 只在 assistant 段计算。
+
+数据流（forward 一次的张量形状）：
+    1. dataloader 每次给一个 packed batch：
+        input_ids       (1, T)      T ≈ max_length（对齐到 8 的倍数后 +64）
+        position_ids    (1, T)
+        loss_mask       (1, T)      1=计入 loss，0=忽略（padding / 非 assistant / EOS）
+        itemic_id_mask  (1, T)      1=该 token 是 Itemic Token（用于分开统计 loss）
+        cu_seqlens      (S+1,)      packing 后每条样本的边界，供 FlashAttn 使用
+        sample_idx      (1, T)      每个 token 属于第几条样本
+    2. model(input_ids) → logits: (1, T, V)  V=词表大小（对齐到 256 倍数）
+    3. shift labels: labels = concat(input_ids[:, 1:], pad)，(1, T)
+    4. labels = labels * loss_mask + ignore_index * (1 - loss_mask)  → 只在有效位置算 loss
+    5. CrossEntropyLoss → scalar loss + per_token_loss (T,)
+
+关键上游/下游：
+    - 上游：base_model_dir 必须是 `pretrain/tools/model_converter/expand_qwen3_vocab.py`
+        扩过词表的 Qwen3（新加了 n_layers × codebook_size 个 Itemic Token + <|sid_begin|> / <|sid_end|>）。
+    - 上游：dataset_config 里 sources 指向的 parquet 数据，来自
+        `data/onerec_data/{pretrain,sft}/*.py` 的产物 + `data/scripts/split_data.py` 分片。
+    - 下游：checkpoint 保存到 output_dir/step{N}/global_step{N}/，用
+        `pretrain/tools/model_converter/convert_checkpoint_to_hf.py` 转成 HF 格式，
+        供 SFT / 蒸馏 / RL / 评测使用。
 """
 
 import os
@@ -689,7 +719,30 @@ def compute_forward_backward(
     embedding_masker: Optional[EmbeddingGradientMasker],
     optimizer: torch.optim.Optimizer,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute forward and backward pass.
+    """执行一次 forward + backward。
+
+    输入 batch 关键字段（详见文件顶部 docstring 的形状说明）：
+        input_ids       (1, T) int64
+        loss_mask       (1, T) int  只在 loss_mask==1 的位置算 loss（SFT: 仅 assistant；pretrain: 全部）
+        attention_mask  (1, T) 或 None（packing 模式下用 cu_seqlens 代替）
+        cu_seqlens      (S+1,) int32  packing 边界，供 FlashAttention 变长 attention 使用
+        position_ids    (1, T)
+
+    关键流程：
+        1) 将 input_ids 中 <=0 的位置置 0（避免作为无效 label 传入 embedding 查表）。
+        2) forward: logits = (1, T, V)。
+        3) shift labels：把 input_ids[:, 1:] 作为下一 token 的目标；末位补一个 ignore_index。
+        4) 用 loss_mask 屏蔽非监督位置 → labels 中该位置置 ignore_index=-100。
+        5) 计算 loss（可选 ChunkedLossComputer，把 lm_head 沿 seq 维分片以省显存）。
+        6) backward；如启用 Stage1 冻结策略（start_optimize_embedding_index > 0），
+           在这里已经不需要手动屏蔽梯度——真正的还原动作放在 optimizer.step() 之后
+           的 embedding_masker.restore_frozen_params() 里。
+        7) 全局梯度裁剪（--max_grad_norm）。
+
+    Returns:
+        loss:            标量 tensor，本 step 平均 loss。
+        per_token_loss:  形状 (T,)，每个位置的 loss（ignore_index 位置为 0）。
+
     
     Args:
         model: Model instance

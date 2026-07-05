@@ -1,3 +1,12 @@
+"""交叉熵损失 + 分块（chunked）版本。
+
+- CrossEntropyLoss：常规 CE，可选 `shift_labels`（自回归错位）与 `return_token_loss`
+    （同时返回 per-token loss，用于计算 Itemic/Text 分开的统计）。
+- ChunkedLossComputer：为超长序列 + 大 lm_head（V ≈ 176k）设计的显存优化。
+    把 seq 维分成 minibatch_size 大小的 chunk，逐个走 lm_head 前向 + 反传，
+    梯度手动累加到 lm_head 权重和输入。避免一次性物化 (T, V) 的 logits。
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,8 +36,18 @@ class CrossEntropyLoss(nn.Module):
     def forward(self, logits: torch.Tensor, labels: torch.Tensor):
         """
         Args:
-            logits (torch.Tensor): A single tensor of shape (..., vocab_size).
-            labels (torch.Tensor): Ground truth labels.
+            logits: (B, T, V) 或已经 flatten 的 (N, V)；V=vocab_size（对齐到 256 倍数）
+            labels: (B, T) 或 (N,)；ignore_index (-100) 表示不计 loss
+        Returns:
+            若 return_token_loss:
+                loss:            标量，等于 sum(per_token_loss) / num_valid_tokens
+                per_token_loss:  (N,)，与 labels flatten 后同长度
+            否则只返回 loss 标量。
+        流程：
+            1) 若 shift_labels，则 logits/labels 各自去尾/去头做自回归错位。
+            2) reshape 到 (-1, V) / (-1,)，用 F.cross_entropy(reduction='none')
+               拿到每个位置的 loss（ignore_index 位置为 0）。
+            3) 手动做 mean/sum reduction，保证除数是"有效 token 数"而不是 N。
         """
         vocab_size = logits.shape[-1]
         

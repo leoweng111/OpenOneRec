@@ -1,9 +1,8 @@
-"""
-Item Understand Task
-Input: caption parquet (pid, dense_caption) + pid2sid parquet
-Output: LLM SFT training format parquet
+"""Item Understanding SFT 数据处理（SID → Caption 生成）。
 
-Task: Given a video SID, generate its description/caption.
+任务：给一个视频 SID，生成对应的视频描述。是 Item Understanding 评测任务的训练侧数据；
+    是 pretrain/item_understand 的反向：pretrain 让模型学"SID + caption 同现"，
+    SFT 让模型学"给 SID 输出 caption"的指令跟随。
 """
 
 import pandas as pd

@@ -1,9 +1,7 @@
-"""
-Ad Recommendation Task (Cross-domain)
-Input: metadata parquet + pid2sid parquet
-Output: LLM SFT training format parquet
+"""广告推荐 SFT 数据处理（跨域）。
 
-Task: Predict ad videos the user will click based on video watch history and ad click history.
+任务：用视频观看历史 + 广告点击历史 → 预测用户下一批可能点击的广告视频。
+广告和视频共用同一份 pid2sid（都是"视频域"）。
 """
 
 import pandas as pd

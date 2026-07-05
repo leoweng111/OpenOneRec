@@ -1,10 +1,8 @@
-"""
-Product Recommendation Task (Cross-domain)
-Input: metadata parquet + video_pid2sid parquet + product_pid2sid parquet
-Output: LLM SFT training format parquet
+"""商品推荐 SFT 数据处理（真跨域）。
 
-Task: Predict product the user will click based on video watch history and product click history.
-Note: Video and product use different pid2sid mappings (different domains).
+任务：用视频观看历史 + 商品点击历史 → 预测用户下一批可能点击的商品。
+关键：视频域和商品域使用不同的 pid2sid（product_pid2sid）。因此同一条
+输出里会混合两个域各自的 SID 空间，模型必须能区分并生成正确的域内 token。
 """
 
 import pandas as pd

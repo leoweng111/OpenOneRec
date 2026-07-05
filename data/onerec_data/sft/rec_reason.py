@@ -1,10 +1,9 @@
-"""
-Recommendation Reasoning Task
-Input: rec_reason parquet (user_profile_with_sid, gsu_caption, target_caption, cot, etc.)
-Output: LLM SFT training format parquet
+"""推荐理由（Reasoning）SFT 数据处理。
 
-Task: Given user profile, watch history captions, and target video caption,
-generate reasoning for why the user would click the target video.
+任务：给用户画像 + 历史观看视频的 caption + 目标视频 caption，
+    生成"为什么用户会点击目标视频"的推理链（CoT / thinking）。
+这是 RecIF-Bench Layer 3 的训练侧数据；与 SFT 阶段 `add_think_pattern=true`
+    的 thinking 模式配套，训练时会在 assistant 里插入 <think>...</think>。
 """
 
 import pandas as pd

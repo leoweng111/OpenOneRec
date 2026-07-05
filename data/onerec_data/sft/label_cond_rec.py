@@ -1,10 +1,8 @@
-"""
-Label Conditional Recommendation Task
-Input: metadata parquet + pid2sid parquet
-Output: LLM SFT training format parquet
+"""Label-conditional 推荐 SFT 数据处理。
 
-Task: Predict items that users will interact with under specific behavior types
-(longview/like/follow/forward/not_interested).
+任务：给定用户多种历史互动 + 一个"目标互动类型"（longview/like/follow/forward/
+    not_interested），预测该类型下用户会互动的下一批 item。
+    与 video_rec 不同，输出的目标序列是被特定行为过滤过的（比如只保留 longview=1 的 target）。
 """
 
 import pandas as pd

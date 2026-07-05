@@ -1,9 +1,24 @@
+"""生成阶段执行器。
+
+职责（单一）：
+    1) 用 data_loader 加载指定 (task, split) 的测试样本。每个样本给出 prompt + ground_truth。
+    2) 调 generator.generate(prompts, **kwargs) → 得到 dict[sample_id → list[str]]，
+       每个 sample 会返回 K 条 completion（K 由 task 的 generation_config 里 num_return_sequences 决定）；
+       另外返回 cumulative logprobs 用于按分数排序。
+    3) 收集 MFU 相关的硬件 & token 统计。
+    4) 把结果 dump 到 `{output_dir}/{model_name}/{task}/{split}_generated.json`。
+
+它不计算任何"对不对"的指标 —— 那是 evaluator 的事，好处：
+    - 生成慢（需要 vLLM 集群），指标算得快；生成一次可反复重算/换指标。
+    - 可以先 sample_size=10 快速跑通 pipeline，再 sample_size=full 正式评测。
 """
-Generation Runner
+
+"""
+Generation Runner (原英文注释保留在下)
 
 Responsible for:
 1. Loading test data via data loader
-2. Calling Generator to produce model outputs  
+2. Calling Generator to produce model outputs
 3. Saving generation results to JSON files
 
 Note: Does NOT compute evaluation metrics (handled by task-specific evaluators)

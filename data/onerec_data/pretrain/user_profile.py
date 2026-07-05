@@ -1,9 +1,7 @@
-"""
-User Profile Pretrain Task
-Input: metadata parquet
-Output: LLM Pretrain format parquet (segments)
+"""User Profile（Pretrain 阶段）数据处理。
 
-Task: Directly use inter_user_profile_with_sid as pretrain text.
+作用：把预先生成的用户兴趣画像文本 `inter_user_profile_with_sid`（其中已经嵌入了 SID）
+    直接作为一条 pretrain segments 样本 —— 让模型学会用画像 + SID 描述用户。
 """
 
 import pandas as pd

@@ -1,8 +1,18 @@
-"""
-Recommendation Task Evaluator
+"""推荐类任务的通用 Evaluator（video / product / ad / label_cond 共用）。
 
-Universal evaluator for all recommendation tasks.
-Computes Pass@k and Position1_Pass@k metrics.
+评测流程（针对每条样本）：
+    1) 拿到模型生成的 K 条 completion 字符串（generations，通常 K=128）和它们各自的
+       cumulative logprob（logprobs）。K 条通常是同一 prompt 用 beam / diverse sampling 得到。
+    2) 若配置 select_k='top_k_by_logprobs'：按 logprob 降序去重重排；'first_k' 则保留原顺序。
+    3) 从每条 generation 里抽出 SID → 得到 predicted_ids 列表（长度 <= K）。
+       ground_truth 里也抽出一到多个 SID（作为正样本集合）。
+    4) 对每个 k ∈ k_values：
+        - Pass@k         predicted_ids[:k] 命中任一 ground truth
+        - Position1_Pass@k predicted_ids[:k] 命中 ground truth 的第一个 SID
+        - Recall@k       predicted_ids[:k] 与 ground truth 的交集 / |ground truth|
+    5) evaluation_mode='both' 时会同时做 SID 层面 & PID 层面 —— 后者需要 sid2pid.json，
+       把每个 SID 映射回真实商品/视频 pid（一个 SID 通常对应多个 pid，用 most_popular 挑一个），
+       再在 pid 空间里计算召回指标。
 """
 
 import json

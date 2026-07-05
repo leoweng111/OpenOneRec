@@ -1,9 +1,9 @@
-"""
-Item Understand Pretrain Task
-Input: caption parquet (pid, dense_caption) + pid2sid parquet
-Output: LLM Pretrain format parquet (segments)
+"""Item Understanding（Pretrain 阶段）数据处理。
 
-Task: Build pretrain data with SID and caption using various templates.
+作用：让 LLM 建立 "视频 SID ↔ 视频文字描述"（caption）之间的语义对齐。
+    产出的每条样本用一个随机模板（JSON / "展示了" / "完整描述"），
+    将 SID 与 caption 拼成一条 text 放进 segments。
+输入：pid2caption parquet (pid, dense_caption) + pid2sid parquet
 """
 
 import pandas as pd

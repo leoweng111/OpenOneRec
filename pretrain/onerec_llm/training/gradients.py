@@ -1,9 +1,16 @@
-"""Gradient computation and manipulation utilities for training.
+"""梯度工具集（FSDP 场景专用）。
 
-This module provides utilities for gradient processing including:
-- Gradient clipping
-- Gradient norm computation for FSDP models
-- Gradient masking for embedding layers in distributed training
+包含：
+- clip_grad_by_value / clip_grad_norm：常规梯度裁剪。
+- compute_fsdp_zero2_grad_norm：手动汇总各 rank 的本地 grad ↦ 全局 L2 范数。
+    FSDP 下 param.grad 是 DTensor，`param.grad.to_local()` 拿到本 rank 分片。
+- EmbeddingGradientMasker：Stage 1（Itemic-Text Alignment）核心组件。
+    只想更新 id ≥ start_optimize_embedding_index 的那部分 Itemic Token embedding，
+    而 id < 阈值 的原 Qwen3 词表 embedding 必须保持不变。做法：
+        构造时把每 rank 本地要冻结的行 clone 出来（saved_weights）；
+        每次 optimizer.step() 之后调用 restore_frozen_params()，把保存的行拷回去，
+        相当于把 optimizer 的更新"撤销"在这段行上。
+    比"梯度置零 + weight decay 归零"更严格：即使 AdamW 的动量、权重衰减也不会污染。
 """
 
 from typing import Optional

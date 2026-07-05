@@ -1,7 +1,12 @@
-"""
-Video Recommendation Task
-Input: metadata parquet + pid2sid parquet
-Output: LLM SFT training format parquet
+"""视频推荐（SFT 阶段）数据处理。
+
+与 pretrain/video_rec.py 的区别：本脚本产生 chat 格式（messages）而非 segments。
+    每条样本是 system + user（含历史 SID）+ assistant（目标 SID）的三轮对话，
+    对应 SFT 训练时 only_assistant_loss=True，只在 assistant 段计 loss。
+
+字段流：
+    hist_video_pid[-512:] → HIST_SIDS 字符串（放进 user prompt 模板）
+    target_video_pid[:10] → TARGET_SIDS 字符串（作为 assistant 输出）
 """
 
 import pandas as pd

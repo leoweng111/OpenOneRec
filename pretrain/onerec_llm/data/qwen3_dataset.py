@@ -1,3 +1,24 @@
+"""Qwen3 的训练数据集与 sample packing。
+
+数据流概览：
+    parquet 文件（含 `messages` 或 `segments` 字段，格式见 `data/README.md`）
+      ↓ Qwen3NaiveParquetDataset：分片到各 rank/worker，读一行、做 local shuffle
+      ↓ Qwen3ChatCompletionParquetDataset._process：
+            - chat 模式：apply_chat_template → tokenize；loss_mask 只在 assistant 段=1
+            - segments 模式：拼接 text → tokenize；loss_mask 全 1（除末尾 EOS）
+      ↓ __iter__：把多个样本拼接（sample packing）填满 max_length
+      ↓ collate → 每个 batch 是一条长度 ≈ max_length 的"打包序列"
+
+产出 batch（供 recipes/train_qwen3.py 使用）：
+    input_ids       (1, T)  T = ceil(max_length/8)*8 + 64
+    position_ids    (1, T)  每条子样本内部从 0 开始（除非 full_attention=True）
+    loss_mask       (1, T)  1=计 loss，0=忽略
+    itemic_id_mask  (1, T)  1=该 token 是 Itemic Token（id 落在 itemic_id_range 里）
+    cu_seqlens      (S+1,)  packing 边界，供 FlashAttention 使用
+    sample_idx      (1, T)  每个 token 属于打包块中的第几条样本
+    epoch_idx       (1,)    浮点，平均 epoch 索引
+"""
+
 import logging
 
 import os
@@ -203,16 +224,21 @@ class Qwen3ChatCompletionDataset(IterableDataset):
     def _get_assistant_mask(self, batch_input_ids: torch.Tensor,
                        start_pattern: Optional[List[int]],
                        end_pattern: Optional[List[int]]):
-        """
-        Generate mask for assistant tokens in chat format.
-        
+        """扫描 token 序列，标出 assistant 段 → loss_mask。
+
+        Chat 模板产出的 token 大致形如：
+            <|im_start|>user\n ... <|im_end|>\n
+            <|im_start|>assistant\n <ASSISTANT_TEXT> <|im_end|>\n
+        只有 <ASSISTANT_TEXT> 那段被计入 loss。函数用两个 pattern：
+            start_pattern = tokenize("<|im_start|>assistant\n")
+            end_pattern   = tokenize("<|im_end|>\n")
+        以子序列匹配的方式找出 start_pattern 之后到 end_pattern 之前的位置置 1。
+        若某个 assistant 段没有匹配到结束 pattern（截断了），则从起点一直标到末尾。
+
         Args:
-            batch_input_ids: Input token IDs
-            start_pattern: Pattern to identify start of assistant response
-            end_pattern: Pattern to identify end of assistant response
-        
+            batch_input_ids: (B, L) int，一般 B=1（本 dataset 每次处理一条样本）
         Returns:
-            mask: Boolean mask indicating which tokens to compute loss on
+            mask: (B, L) int64，1=assistant token，0=其他
         """
         if not start_pattern:
             start_pattern = self.assistant_start_pattern
@@ -434,7 +460,21 @@ class Qwen3ChatCompletionDataset(IterableDataset):
         return len(inputs["input_ids"][0])
 
     def _packing(self, buffer: List[Dict[str, torch.Tensor]]):
-        packed_input_ids: List[torch.Tensor] = []
+        """把 buffer 里多个短样本 concat 成一条长度 ≈ max_length 的"packed 序列"。
+
+        Sample packing 是把 N 条短样本沿 seq 维拼起来放进一个 batch，配合 FlashAttention 的
+        cu_seqlens 变长 attention，可以避免 padding 浪费，是 pretrain 阶段的核心加速手段。
+
+        输入 buffer：List[{"input_ids": (1, L_i), "loss_mask": (1, L_i), ...}]，共 N 条。
+        产出（形状说明中 T = ceil(max_length/8)*8 + 64）：
+            input_ids       (1, T)
+            position_ids    (1, T)   每条样本内 0..L_i-1；padding 段用 0
+            loss_mask       (1, T)   末尾 padding 段=0
+            itemic_id_mask  (1, T)
+            cu_seqlens      (N+2,)   [0, L_0, L_0+L_1, ..., sum_L, T]，最后一段是 padding
+            sample_idx      (1, T)   token 属于哪条源样本；padding 段=-1
+            epoch_idx       (1,)     float32
+        """
         packed_position_ids: List[torch.Tensor] = []
         packed_loss_mask: List[torch.Tensor] = []
         packed_itemic_id_mask: List[torch.Tensor] = []

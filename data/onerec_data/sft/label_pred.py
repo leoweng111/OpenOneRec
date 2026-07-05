@@ -1,10 +1,16 @@
-"""
-Label Prediction Task (Point-wise Classification)
-Input: metadata parquet + pid2sid parquet
-Output: LLM SFT training format parquet
+"""标签预测（point-wise 分类）SFT 数据处理。
 
-Task: Predict whether a user will "longview" (watch for a long time) a candidate video.
-Binary classification: "是" (yes) or "否" (no).
+任务：给定用户多种类型的历史互动（longview / like / follow / forward / not_interested）
+    + 一个候选视频，预测用户是否会"长时观看"该视频。二分类 answer = "是" / "否"。
+
+关键点：
+    1) 一条原始 row（一个用户的目标视频列表）会展开为多条 SFT 样本 —— 每个候选视频
+       是一个独立分类题；因此该脚本正样本/负样本数会独立打印。
+    2) INTERACTION_TYPES 决定 user prompt 里罗列几种历史 —— 通过随机模板拼接，
+       让模型见到不同表述。
+    3) 候选视频 SID 用 pid_to_sid 转成 5 个 Itemic Token 插入问题里。
+
+输出：source='RecIF_LabelPred'，messages 三段 (system, user, assistant)。
 """
 
 import pandas as pd

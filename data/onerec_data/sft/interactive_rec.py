@@ -1,10 +1,8 @@
-"""
-Interactive Recommendation Task
-Input: metadata parquet + pid2sid parquet
-Output: LLM SFT training format parquet
+"""交互式推荐 SFT 数据处理。
 
-Task: Given user profile (inter_user_profile_with_sid) and search keyword,
-predict items the user will interact with.
+任务：给定用户画像（inter_user_profile_with_sid）+ 一个搜索关键词，
+    预测用户此时会互动的一批 item。这体现"指令跟随" —— 关键词决定推荐范围。
+一条原始 row 有多个 keyword，每个 keyword 展开为一条 SFT 样本。
 """
 
 import pandas as pd

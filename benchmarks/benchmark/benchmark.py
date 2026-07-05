@@ -1,3 +1,24 @@
+"""RecIF-Bench 评测框架总入口。
+
+调用方式（见 `benchmarks/eval_script.sh`）：
+    from benchmark import Benchmark
+    b = Benchmark(model_path=..., data_dir=..., enable_thinking=False,
+                  task_types=[...], splits=["test"])
+    b.run(generator=YourGenerator(...), output_dir="./results")   # 只做生成，产出 *_generated.json
+    Benchmark.evaluate_dev(generation_results_dir="./results",     # 独立算指标
+                           output_path="./eval_results.json",
+                           data_dir=...)
+
+两个阶段严格分离：
+    1) run() —— 遍历 (task, split)，通过 DataLoaderWrapper 加载数据、调 generator.generate
+       得到 K 条 completion + 每条的 cumulative logprob，写入
+       `{output_dir}/{model_name}/{task}/{split}_generated.json`。
+    2) evaluate_dev() —— 扫上一步的目录，为每个任务查 registry 找对应 evaluator 计算指标
+       （Recall@K、Pass@K、LLM-as-Judge 等），写入 eval_results.json。
+
+任务清单和默认参数（k_values、sample_size、prompt_config）来自 tasks.registry。
+"""
+
 import os
 import json
 from typing import Any, Dict, List, Optional, Tuple, Union

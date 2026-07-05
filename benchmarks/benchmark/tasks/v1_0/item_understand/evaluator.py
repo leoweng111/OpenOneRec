@@ -1,3 +1,10 @@
+"""Item Understanding 任务评测器（LLM-as-Judge）。
+
+任务：给模型一个视频 SID，让它生成描述；用一个更强的 LLM（默认 Gemini，见
+    `benchmarks/api/`）作为 Judge 对生成 caption 与 gold caption 之间的
+    "语义覆盖度"打分（macro_wip_double_weighted_f1）。
+"""
+
 """
 Item Understand Evaluator
 

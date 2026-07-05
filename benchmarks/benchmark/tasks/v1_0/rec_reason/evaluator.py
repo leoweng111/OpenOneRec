@@ -1,3 +1,10 @@
+"""推荐理由（rec_reason）任务评测器（LLM-as-Judge）。
+
+任务：给模型 user_profile + 历史 caption + 目标视频 caption，让模型输出
+    <think>...</think> 后的推理链；用外部 LLM 判分 → llm_score（0-5 分）。
+`extract_after_think` 只取 </think> 之后的正式回答部分参与打分。
+"""
+
 """
 Recommendation Reason Evaluator
 

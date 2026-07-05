@@ -1,3 +1,12 @@
+"""标签预测（label_pred）任务的评测器。
+
+任务性质：二分类（用户是否会长时观看候选视频）。指标只有一个：AUC。
+关键点：模型的答案不是 "是"/"否" 那么简单，而是通过 forced generation
+    的方式在 `<是>`/`<否>` 两个 token 上取 logprob，用 softmax 得到"是"的概率
+    p ∈ (0, 1)，再和真实 label 一起过 sklearn 的 AUC。这样能利用 logits 强度
+    做排序，而不是硬 argmax，效果更稳。
+"""
+
 """
 Label Prediction Task Evaluator
 

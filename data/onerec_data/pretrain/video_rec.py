@@ -1,9 +1,28 @@
-"""
-Video Recommendation Pretrain Task
-Input: metadata parquet + pid2sid parquet
-Output: LLM Pretrain format parquet (segments instead of messages)
+"""视频推荐（Pretrain 阶段）数据处理。
 
-Task: Directly concatenate history SIDs and target SIDs without prompts.
+作用：把每个用户"最近历史视频序列 + 下一批目标视频序列"转成一条 pretrain
+    segments 样本（无 prompt、纯 SID 拼接）。目的是让 LLM 学会在给定
+    history SID 之后自然续写 target SID —— 这是把"推荐"当作序列建模的核心 loss。
+
+输入：
+    metadata parquet    列: uid, split, hist_video_pid, target_video_pid
+    pid2sid parquet     列: pid, sid（sid 是长度 3 的 int 数组，形如 [340, 6566, 5603]）
+
+输出（一条样本）：
+    source     'RecIF_VideoRec_Pretrain'
+    uuid       随机
+    segments   [{"type":"text","text": HIST_SIDS + TARGET_SIDS}]
+                其中每个 SID 被格式化为
+                '<|sid_begin|><s_a_{c0}><s_b_{c1}><s_c_{c2}><|sid_end|>'
+                即 5 个 Itemic Token（两个特殊 + 三个 codebook token）。
+
+流程：
+    1) 读入 pid2sid → dict
+    2) 只保留 split == 0（训练集）
+    3) 每条 row：取最近 HIST_MAX_LEN 个 hist pid + 前 TARGET_MAX_LEN 个 target pid
+       → 全部翻译成 SID 拼成一条长字符串
+    4) 打包成 segments 格式的 dataframe，写到 train.parquet
+下游：`data/scripts/split_data.py` 会把该 parquet 分片给 pretrain dataloader。
 """
 
 import pandas as pd
