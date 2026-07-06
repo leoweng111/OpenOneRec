@@ -1,0 +1,26 @@
+notes/semantic_id.md
+  s_03a7d421ee88ad::t_3cc3d7713d060d 1286
+  s_03a7d421ee88ad::t_75582aec720193 1308,1316
+  s_03a7d421ee88ad::t_b017a87cc4545e 1318
+  s_03a7d421ee88ad::t_18c979867ff7f5 261,442-443,724,780,782
+  s_03a7d421ee88ad::t_336e72e33d554b 1294-1295
+  s_03a7d421ee88ad::t_68c6fb29472703 1124-1216,1218-1284
+  s_03a7d421ee88ad::t_7fa1206c38bb96 1364-1366,1368,1370
+  s_03a7d421ee88ad::t_a36c015221d83c 41-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.28-trip",
+  "base_commit_sha": "69dd9ef1d6902cf96c59e932e005855acdccf4c7",
+  "prompts": {},
+  "sessions": {
+    "s_03a7d421ee88ad": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b33e2d6-59d9-466c-8cbf-797effd933ea",
+        "model": "qwen3.7-max"
+      },
+      "human_author": "leoweng111 <1404813015@qq.com>"
+    }
+  }
+}
