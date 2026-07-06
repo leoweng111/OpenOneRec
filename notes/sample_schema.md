@@ -1,8 +1,10 @@
 # 生成式推荐三种样本组织方式对比
 
-> 面向读者：想把"OneRec 的样本到底是什么样、和传统做法差在哪里"一次搞清楚的人。
+> 主要内容：Naive Impression、User-Centric、New Impression Only这三种常见样本组织方式的介绍，同时包含point-wise, query-wise等的简单介绍 
 >
-> 结论先行：**开源版 OneRec pretrain 用的是 User-Centric（一行=一个用户，全序列 loss）**；
+>本篇介绍以快手OneRec为例进行说明
+>
+> 结论先行：**开源版 OpenOneRec pretrain 用的是 User-Centric（一行=一个用户，全序列 loss）**；
 > **快手线上 OneRec-V2 用的是 New Impression Only（一条=一次曝光，只在 target 上算 loss，流式训练）**。
 > 中间还有一种 **Naive Impression**（一条=一次曝光，全序列 loss）是被两者共同淘汰的方案。
 >
@@ -62,6 +64,7 @@ U3                                 A
       Sample₅ (t₅,U3,A):  context=[],      target=A     loss = {A}
       Sample₆ (t₆,U1,C):  context=[A,B],   target=C     loss = {C}
 ```
+其中context代表的是曝光前的历史行为流，target代表的是当前曝光的item。
 
 **一句话对比：**
 
@@ -103,10 +106,10 @@ Sample₆ (t₆, U1, target=C):
 ### 2.3 Batch 形状（假设 batch_size=4，max_seq_len=T）
 
 ```python
-input_ids  : (B=4, T)   int64      # 每条独立填充到 T
+input_ids  : (B=4, T)   int64      # 每条样本都是一个序列，独立填充到 T
 attn_mask  : (B=4, T)   int        # 1=有效，0=padding
 loss_mask  : (B=4, T)   int        # 1=算 loss，0=不算（padding + sid_begin 等）
-labels     : (B=4, T)   int64      # = input_ids 右移 + ignore_index 屏蔽 loss_mask==0
+labels     : (B=4, T)   int64      # = input_ids 左移一位 + ignore_index 屏蔽 loss_mask==0
 ```
 
 Loss:
@@ -114,7 +117,7 @@ $$\mathcal{L} = \frac{1}{|\{k:\text{loss\_mask}_k=1\}|} \sum_{k:\text{loss\_mask
 
 ### 2.4 训练与推理
 
-- **训练**：batch 内样本可任意打乱；因为每条样本自带完整 context，不依赖其他样本。
+- **训练**：batch 内样本可任意打乱，一个batch内样本可以来自不用用户，或者包含相同用户的不同请求（不过通常会把一次请求的所有候选item放在一个batch内），总条数等于batch_size即可；因为每条样本自带完整 context，不依赖其他样本。
 - **推理**：给用户当前完整历史，让模型自回归生成下一个 SID → item。
 
 ### 2.5 应用场景 / 为什么被淘汰
@@ -143,8 +146,9 @@ Sample U3:  [A]        loss on all
 
 ### 3.3 Batch 形状（开源版实际值：`batch_size=1`，seq packing）
 
-参考本仓库开源实现（`pretrain/onerec_llm/data/qwen3_dataset.py`）：
+[参考快手OneRec开源实现](https://github.com/Kuaishou-OneRec/OpenOneRec)（`pretrain/onerec_llm/data/qwen3_dataset.py`）：
 
+以及[RQ-VAE+Transformer开源实现](https://github.com/EdoardoBotta/RQ-VAE-Recommender)
 ```python
 input_ids       : (1, T)  int64,  T ≈ 30016 (max_length=30000 对齐 8 后 +64)
 position_ids    : (1, T)
@@ -182,7 +186,7 @@ $$\mathcal{L}_{\text{user-centric}} = \frac{1}{\sum_u L_u - 1} \sum_u \sum_{k=1}
 
 热门 item（如例子中的 A）在多个用户的历史里都出现。User-Centric 下 A 会被多次算 loss（U1 一次、U3 一次），加剧头部 item 的过训练。
 
-### 3.7 无法增量 / 流式更新
+### 3.7 无法增量 / 流式更新（最大问题）
 
 要拼出 U1 的样本，你必须**等到 U1 的所有历史都产生完**（例子里到 t₆ 之后）。这跟"曝光一条来一条训"完全对立。
 
@@ -276,7 +280,7 @@ Batch 2  (处理 t₄, t₅, t₆):
 - **Batch 之间**：必须严格按时间偏序。Batch 2 只能用 W₁（已经消化了 t₁..t₃）来处理 t₄..t₆ 的数据。这就是 streaming training 的字面含义。
 
 **线上真实情况**：数据源以 Kafka/流的形式实时推曝光记录，训练器按分钟窗口消费。**"每分钟"不是样本切分粒度，而是"每分钟大约有多少条曝光会作为下一波训练输入"**：
-
+在我们的场景下，这块需要改造训练框架的消费逻辑，保证**宏观上按时间顺序**，微观上 batch 内并行。或者按照One-Epoch的day by day训练策略，其实我认为也可行。
 ```
 Kafka topic: impression_stream
     ├── minute 09:00 -- 例如 5000 万条曝光 → 切成 batch_size=8192 的 N 个 batch → 训练器按序消费 N 步
@@ -292,7 +296,7 @@ Kafka topic: impression_stream
 - 线上服务：给某用户当前 context（≤t 时刻的所有历史）→ 用**最新 W_t** 模型自回归生成一个（或多个候选）SID → 走后续 ranker / 直接曝光。
 - **训练和推理数据形态完全一致**：一次前向都是"context → target"，只是训练时 target 是 ground-truth（用户实际会看的），推理时 target 是模型生成的。因此几乎没有 train-serve skew。
 
-### 4.7 为什么工业界认为它是"主流"
+### 4.7 为什么这是目前"主流"的业界做法
 
 综合 [OneRec-V2 §2.1](https://arxiv.org/html/2508.20900)：
 
@@ -307,6 +311,246 @@ Kafka topic: impression_stream
 - 需要一套流式训练基础设施：Kafka + 训练器持续消费 + 快速权重 checkpoint 与 hot-swap。
 - 单条样本上下文短（就是这次曝光的历史），要充分利用长上下文得靠**在样本里塞更长的用户历史**（context 段变长），比 User-Centric 那种"整条打包"的写法要精细设计截断策略。
 - 反馈延迟：用户点击、长时观看等正反馈可能到曝光后几秒~几十秒才产生。快手用 fast-slow window（5min 快窗 + 1h 慢窗）来处理（参见 [Moment&Cross](https://arxiv.org/html/2508.20900) 相关工作）。
+
+---
+
+
+
+## 5. LLM4DLRMs 样本组织变革：从 Pointwise 到 Request-wise / Set-wise
+
+> 上面 §1-§8 讨论的三种样本组织方式（Naive Impression / User-Centric / New Impression Only）都属于 **LLM4GRs（生成式推荐）** 范式。
+> 在 **LLM4DLRMs（深度推荐模型）** 范式中，样本组织也在经历一场平行的变革：从传统 **Pointwise** 演进到 **Request-wise（List-wise）** 和 **Set-wise**。
+> 本节梳理这条演进线，并讨论它与 LLM4GRs 三种方式的交叉可能性。
+
+### 5.1 传统 Pointwise 样本
+
+**做法**：每个 (用户, 物品) 对独立成一条样本。
+
+```
+传统 DLRM 样本:
+  Sample₁: user=U1, item=A, label=1 (点击)
+  Sample₂: user=U1, item=B, label=0 (未点击)
+  Sample₃: user=U2, item=X, label=1
+  Sample₄: user=U1, item=C, label=1
+```
+
+**特点**：
+- 一条样本只包含一个 target item
+- 模型对每个 item 独立打分：$\hat{y} = f_\theta(\text{user_feats}, \text{item_feats})$
+- 样本数 = 曝光总数 $N$
+- **问题**：同一请求中的多个候选 item 之间无交互；无法利用候选间的上下文关系
+
+### 5.2 Request-wise / List-wise 样本（当前主流）
+**做法**：基于**请求维度**组织样本，将同一次请求中下发（或曝光）的多个 item 打包为一条样本。
+
+**代表工作**：网易云音乐 [Climber / ASTRO](https://arxiv.org/abs/2502)（2025年2月）
+
+> Climber 将每次请求下发的最多 5 个交互 item 处理为一条样本，将多个 item 的特征和 label 拼成一个 list，共用 user 特征。
+
+```
+Request-wise 样本:
+  Sample₁ (request r₁, U1):
+    user_feats: {U1的特征}
+    items: [
+      {item=A, feats_A, label=1},
+      {item=B, feats_B, label=0},
+      {item=C, feats_C, label=1},
+    ]
+    → 一条样本包含 3 个 item，共用 user 特征
+
+  Sample₂ (request r₂, U2):
+    user_feats: {U2的特征}
+    items: [
+      {item=X, feats_X, label=1},
+      {item=Y, feats_Y, label=1},
+    ]
+```
+
+**特点**：
+- 一条样本 = 一次请求，包含 $K$ 个 item（$K$ 通常为 3~10）
+- User 特征只存一份，$K$ 个 item 共享 → **样本压缩**
+- 同一请求内的 target item 之间**注意力互相 mask**，无交互
+- 样本数 = 请求数 $R \ll N$
+- **优势**：
+  - 存储压缩：user 特征不重复存储
+  - 适配增量/流式更新：每个请求独立成样本，无需等用户历史攒够
+  - 天然解决时序泄漏：按请求时间排序即可
+
+**Batch 形状**：
+```python
+user_feats : (B, D_user)           # B个请求的user特征
+item_feats : (B, K, D_item)        # 每个请求K个item特征
+labels     : (B, K)                # 每个item的label (0/1)
+item_mask  : (B, K)                # 有效item mask (实际item数可能 < K)
+```
+
+### 5.3 Set-wise 样本（美团 HoMer）
+
+**做法**：将同一请求中粗排给精排的**大量候选 item**（美团是 300 个）打包为一条样本，在单次模型调用中预测所有 item 的 CTR。
+
+**代表工作**：美团 [HoMer](https://arxiv.org/abs/2510.11100)（2025年10月）
+
+> HoMer 将预测范式从 point-wise 转为 set-wise，将所有候选 item 的非序列特征聚合到一条样本中，实现跨 item 交互和并行预测。
+
+```
+Set-wise 样本:
+  Sample₁ (request r₁, U1):
+    user_feats: {U1的特征}
+    user_sequence: [A, B, X, ...]     # 用户历史行为序列
+    candidates: [                     # 300个候选item
+      {item=I₁, feats₁},
+      {item=I₂, feats₂},
+      ...
+      {item=I₃₀₀, feats₃₀₀},
+    ]
+    labels: [label₁, label₂, ..., label₃₀₀]
+    → 一条样本包含 300 个候选 item
+```
+
+**与 Request-wise 的关键区别**：
+
+| 维度 | Request-wise | Set-wise |
+|------|-------------|----------|
+| 候选 item 数 | 少（3~10，已曝光的） | 多（~300，粗排给精排的） |
+| 包含未曝光 item | ❌ 仅曝光 item | ✅ 包含未曝光候选 |
+| Item 间交互 | ❌ 互相 mask | ✅ 跨 item attention |
+| 模型调用次数/请求 | 1 次（但 item 间无交互） | 1 次（且 item 间有交互） |
+| 存储成本 | 低 | 较高（但比 pointwise 仍低） |
+
+**Set-wise 的优势**（HoMer 论文验证）：
+- **跨 item 交互**：候选 item 之间可以互相 attend，捕获比较信号
+- **效率提升**：一次请求只需一次模型调用，300 个 item 并行预测
+- **存储压缩**：user 特征和历史序列只存一份，300 个候选共享
+- **更丰富训练信号**：包含未曝光 item（负样本），训练分布更完整
+
+### 5.4 三种 DLRM 样本方式对比
+
+| 维度 | Pointwise | Request-wise | Set-wise |
+|------|-----------|-------------|----------|
+| 一条样本 = | 一个 (user, item) 对 | 一次请求的曝光 item | 一次请求的全部候选 |
+| 样本数 | $N$（曝光总数） | $R$（请求数） | $R$（请求数） |
+| 单样本 item 数 | 1 | $K$（3~10） | $K$（~300） |
+| User 特征存储 | 每条重复 | 共享 | 共享 |
+| Item 间交互 | ❌ | ❌（互相 mask） | ✅（跨 item attention） |
+| 包含未曝光候选 | 否 | 否 | 是 |
+| 适配流式训练 | 可以 | ✅ 天然适配 | ✅ 天然适配 |
+| 时序泄漏风险 | 低 | 低 | 低 |
+| 存储效率 | 差（user重复） | 好 | 好 |
+| 代表系统 | 传统 DLRM | Climber (网易云) | HoMer (美团) |
+
+### 5.5 LLM4DLRMs 与 LLM4GRs 样本组织的结合
+
+LLM4DLRMs 的 Request-wise / Set-wise 思路和 LLM4GRs 的 New Impression Only 等方案**并非互斥**，可以组合使用：
+
+#### 5.5.1 Request-wise 存储 + New Impression Only 训练
+
+```
+存储层（Request-wise）:
+  每条记录 = 一次请求
+  {
+    "request_id": "r_001",
+    "timestamp": 1712345678,
+    "user_id": "U1",
+    "user_context": [历史SID序列],
+    "impressed_items": [              # 曝光的K个item
+      {"sid": [3,7,22], "label": 1},
+      {"sid": [15,8,91], "label": 0},
+      {"sid": [42,3,67], "label": 1},
+    ]
+  }
+
+训练层（New Impression Only）:
+  从每条请求记录中，对每个impressed item拆出独立样本：
+  Sample₁: context=[历史], target=[3,7,22],    loss_mask=仅target
+  Sample₂: context=[历史], target=[15,8,91],   loss_mask=仅target
+  Sample₃: context=[历史], target=[42,3,67],   loss_mask=仅target
+```
+
+**优势**：
+- 存储层用 Request-wise 压缩（user 特征不重复）
+- 训练层用 NIO 避免冗余 loss 和时序泄漏
+- 两者兼得
+
+#### 5.5.2 Set-wise 存储 + User-Centric 训练
+
+```
+存储层（Set-wise）:
+  每条记录 = 一次请求，含300个候选
+  {
+    "user_id": "U1",
+    "user_sequence": [A, B, X, ...],
+    "candidates": [I₁, I₂, ..., I₃₀₀],
+    "labels": [1, 0, 0, ..., 1],
+  }
+
+训练层（类User-Centric, 但loss在target上）:
+  将用户序列 + 所有候选拼成一条长序列
+  loss_mask: user_sequence段=0, target候选段=1
+```
+
+#### 5.5.3 结合方式对比
+
+| 存储方式 \ 训练方式 | Naive Impression | User-Centric | New Impression Only |
+|:--|:--|:--|:--|
+| **Pointwise** (传统) | ✅ 经典 | ✅ 开源OneRec | ✅ OneRec-V2 |
+| **Request-wise** (Climber式) | ✅ 拆成多条 | ⚠️ 需合并多请求 | ✅ **推荐组合**：存储压缩+NIO无泄漏 |
+| **Set-wise** (HoMer式) | ⚠️ 候选太多效率低 | ⚠️ 需特殊mask | ✅ 候选内仅target有loss |
+
+### 5.6 存储效率对比
+
+不同样本组织方式对存储空间的影响（假设：$U$ 个用户，$N$ 次曝光，$R$ 次请求，平均每次请求 $K$ 个曝光，$C$ 个候选）：
+
+| 样本方式 | 样本条数 | User特征存储次数 | 总存储量级 | 相对Pointwise压缩比 |
+|----------|---------|----------------|-----------|:--:|
+| Pointwise | $N$ | $N$ 次 | $N \times (D_{\text{user}} + D_{\text{item}})$ | 1× |
+| Request-wise | $R = N/K$ | $R$ 次 | $R \times D_{\text{user}} + N \times D_{\text{item}}$ | ~$K$×（user特征部分） |
+| Set-wise | $R$ | $R$ 次 | $R \times D_{\text{user}} + R \times C \times D_{\text{item}}$ | 视$C$而定 |
+| User-Centric | $U$ | $U$ 次 | $U \times D_{\text{user}} + N \times D_{\text{item}}$ | ~$N/U$× |
+
+**具体数值示例**（快手量级）：
+- $U = 4 \times 10^8$ 用户，$N = 10^{10}$ 日曝光，$R = 2 \times 10^9$ 日请求，$K \approx 5$
+- $D_{\text{user}} = 2$KB，$D_{\text{item}} = 500$B
+
+| 方式 | 日存储估算 |
+|------|-----------|
+| Pointwise | $10^{10} \times 2.5\text{KB} \approx 25\text{TB}$ |
+| Request-wise | $2\times10^9 \times 2\text{KB} + 10^{10} \times 0.5\text{KB} \approx 9\text{TB}$ |
+| User-Centric | $4\times10^8 \times 2\text{KB} + 10^{10} \times 0.5\text{KB} \approx 5.8\text{TB}$ |
+
+> **结论**：Request-wise 比 Pointwise 节省约 60% 存储（主要来自 user 特征不重复）；User-Centric 在 GR 场景下最省（但牺牲了流式能力）。
+> **New Impression Only + Request-wise 存储** 是工业界 GR 场景下的最优组合：既省存储又支持流式。
+
+### 5.7 小结
+
+```
+LLM4GRs 样本演进:
+  Naive Impression → User-Centric → New Impression Only
+  (全序列loss,冗余)   (用户级,泄漏)    (仅target loss,流式)
+
+LLM4DLRMs 样本演进:
+  Pointwise → Request-wise/List-wise → Set-wise
+  (单item独立)   (请求级打包,共享user)    (候选级打包,item交互)
+
+两者可以正交组合：
+  存储层选 Request-wise/Set-wise (压缩)
+  ×
+  训练层选 New Impression Only (无泄漏,流式)
+  =
+  工业最优实践
+```
+
+---
+
+## 6. Sources / 参考文献（补充）
+
+- [OneRec-V2 Technical Report (arXiv:2508.20900)](https://arxiv.org/abs/2508.20900) — 三种样本组织方式的定义、Figure 3 图示、streaming training 实验设置的出处。
+- [OneRec-V2 HTML 版](https://arxiv.org/html/2508.20900) — §2.1 Design Principles 原文可直接查阅。
+- [HoMer: Addressing Heterogeneities by Modeling Sequential and Set-wise Contexts for CTR Prediction (arXiv:2510.11100)](https://arxiv.org/abs/2510.11100) — 美团，Set-wise 样本组织范式的代表工作。
+- [Climber / ASTRO: An Efficient Large Recommendation Model (arXiv:2502)](https://arxiv.org/abs/2502) — 网易云音乐，Request-wise 样本组织的代表工作。
+- 本仓库开源代码 —— User-Centric 实现的对照参考：
+  - `pretrain/onerec_llm/data/qwen3_dataset.py::_process_completion` (pretrain 全序列 loss)
+  - `pretrain/onerec_llm/data/qwen3_dataset.py::_get_assistant_mask` + `_process_chat` (SFT target-only loss，最接近 NIO)
+  - `data/onerec_data/pretrain/video_rec.py` (User-Centric 样本生成)
 
 ---
 
@@ -421,7 +665,7 @@ New Impression Only: Sample₆ = [ A , B , C ]
 
 ---
 
-## 6. 代码层落地对照（相对本仓库现状）
+## 补. 代码层落地对照（相对本仓库现状）
 
 本仓库开源版 pretrain 走 User-Centric。要改成 New Impression Only 需要动的最小代码集合：
 
@@ -456,246 +700,7 @@ New Impression Only: Sample₆ = [ A , B , C ]
 
 ---
 
-## 9. LLM4DLRMs 样本组织变革：从 Pointwise 到 Request-wise / Set-wise
-
-> 上面 §1-§8 讨论的三种样本组织方式（Naive Impression / User-Centric / New Impression Only）都属于 **LLM4GRs（生成式推荐）** 范式。
-> 在 **LLM4DLRMs（深度推荐模型）** 范式中，样本组织也在经历一场平行的变革：从传统 **Pointwise** 演进到 **Request-wise（List-wise）** 和 **Set-wise**。
-> 本节梳理这条演进线，并讨论它与 LLM4GRs 三种方式的交叉可能性。
-
-### 9.1 传统 Pointwise 样本
-
-**做法**：每个 (用户, 物品) 对独立成一条样本。
-
-```
-传统 DLRM 样本:
-  Sample₁: user=U1, item=A, label=1 (点击)
-  Sample₂: user=U1, item=B, label=0 (未点击)
-  Sample₃: user=U2, item=X, label=1
-  Sample₄: user=U1, item=C, label=1
-```
-
-**特点**：
-- 一条样本只包含一个 target item
-- 模型对每个 item 独立打分：$\hat{y} = f_\theta(\text{user\_feats}, \text{item\_feats})$
-- 样本数 = 曝光总数 $N$
-- **问题**：同一请求中的多个候选 item 之间无交互；无法利用候选间的上下文关系
-
-### 9.2 Request-wise / List-wise 样本（当前主流）
-
-**做法**：基于**请求维度**组织样本，将同一次请求中下发（或曝光）的多个 item 打包为一条样本。
-
-**代表工作**：网易云音乐 [Climber / ASTRO](https://arxiv.org/abs/2502)（2025年2月）
-
-> Climber 将每次请求下发的最多 5 个交互 item 处理为一条样本，将多个 item 的特征和 label 拼成一个 list，共用 user 特征。
-
-```
-Request-wise 样本:
-  Sample₁ (request r₁, U1):
-    user_feats: {U1的特征}
-    items: [
-      {item=A, feats_A, label=1},
-      {item=B, feats_B, label=0},
-      {item=C, feats_C, label=1},
-    ]
-    → 一条样本包含 3 个 item，共用 user 特征
-
-  Sample₂ (request r₂, U2):
-    user_feats: {U2的特征}
-    items: [
-      {item=X, feats_X, label=1},
-      {item=Y, feats_Y, label=1},
-    ]
-```
-
-**特点**：
-- 一条样本 = 一次请求，包含 $K$ 个 item（$K$ 通常为 3~10）
-- User 特征只存一份，$K$ 个 item 共享 → **样本压缩**
-- 同一请求内的 target item 之间**注意力互相 mask**，无交互
-- 样本数 = 请求数 $R \ll N$
-- **优势**：
-  - 存储压缩：user 特征不重复存储
-  - 适配增量/流式更新：每个请求独立成样本，无需等用户历史攒够
-  - 天然解决时序泄漏：按请求时间排序即可
-
-**Batch 形状**：
-```python
-user_feats : (B, D_user)           # B个请求的user特征
-item_feats : (B, K, D_item)        # 每个请求K个item特征
-labels     : (B, K)                # 每个item的label (0/1)
-item_mask  : (B, K)                # 有效item mask (实际item数可能 < K)
-```
-
-### 9.3 Set-wise 样本（美团 HoMer）
-
-**做法**：将同一请求中粗排给精排的**大量候选 item**（美团是 300 个）打包为一条样本，在单次模型调用中预测所有 item 的 CTR。
-
-**代表工作**：美团 [HoMer](https://arxiv.org/abs/2510.11100)（2025年10月）
-
-> HoMer 将预测范式从 point-wise 转为 set-wise，将所有候选 item 的非序列特征聚合到一条样本中，实现跨 item 交互和并行预测。
-
-```
-Set-wise 样本:
-  Sample₁ (request r₁, U1):
-    user_feats: {U1的特征}
-    user_sequence: [A, B, X, ...]     # 用户历史行为序列
-    candidates: [                     # 300个候选item
-      {item=I₁, feats₁},
-      {item=I₂, feats₂},
-      ...
-      {item=I₃₀₀, feats₃₀₀},
-    ]
-    labels: [label₁, label₂, ..., label₃₀₀]
-    → 一条样本包含 300 个候选 item
-```
-
-**与 Request-wise 的关键区别**：
-
-| 维度 | Request-wise | Set-wise |
-|------|-------------|----------|
-| 候选 item 数 | 少（3~10，已曝光的） | 多（~300，粗排给精排的） |
-| 包含未曝光 item | ❌ 仅曝光 item | ✅ 包含未曝光候选 |
-| Item 间交互 | ❌ 互相 mask | ✅ 跨 item attention |
-| 模型调用次数/请求 | 1 次（但 item 间无交互） | 1 次（且 item 间有交互） |
-| 存储成本 | 低 | 较高（但比 pointwise 仍低） |
-
-**Set-wise 的优势**（HoMer 论文验证）：
-- **跨 item 交互**：候选 item 之间可以互相 attend，捕获比较信号
-- **效率提升**：一次请求只需一次模型调用，300 个 item 并行预测
-- **存储压缩**：user 特征和历史序列只存一份，300 个候选共享
-- **更丰富训练信号**：包含未曝光 item（负样本），训练分布更完整
-
-### 9.4 三种 DLRM 样本方式对比
-
-| 维度 | Pointwise | Request-wise | Set-wise |
-|------|-----------|-------------|----------|
-| 一条样本 = | 一个 (user, item) 对 | 一次请求的曝光 item | 一次请求的全部候选 |
-| 样本数 | $N$（曝光总数） | $R$（请求数） | $R$（请求数） |
-| 单样本 item 数 | 1 | $K$（3~10） | $K$（~300） |
-| User 特征存储 | 每条重复 | 共享 | 共享 |
-| Item 间交互 | ❌ | ❌（互相 mask） | ✅（跨 item attention） |
-| 包含未曝光候选 | 否 | 否 | 是 |
-| 适配流式训练 | 可以 | ✅ 天然适配 | ✅ 天然适配 |
-| 时序泄漏风险 | 低 | 低 | 低 |
-| 存储效率 | 差（user重复） | 好 | 好 |
-| 代表系统 | 传统 DLRM | Climber (网易云) | HoMer (美团) |
-
-### 9.5 LLM4DLRMs 与 LLM4GRs 样本组织的结合可能性
-
-LLM4DLRMs 的 Request-wise / Set-wise 思路和 LLM4GRs 的 New Impression Only 等方案**并非互斥**，可以组合使用：
-
-#### 9.5.1 Request-wise 存储 + New Impression Only 训练
-
-```
-存储层（Request-wise）:
-  每条记录 = 一次请求
-  {
-    "request_id": "r_001",
-    "timestamp": 1712345678,
-    "user_id": "U1",
-    "user_context": [历史SID序列],
-    "impressed_items": [              # 曝光的K个item
-      {"sid": [3,7,22], "label": 1},
-      {"sid": [15,8,91], "label": 0},
-      {"sid": [42,3,67], "label": 1},
-    ]
-  }
-
-训练层（New Impression Only）:
-  从每条请求记录中，对每个impressed item拆出独立样本：
-  Sample₁: context=[历史], target=[3,7,22],    loss_mask=仅target
-  Sample₂: context=[历史], target=[15,8,91],   loss_mask=仅target
-  Sample₃: context=[历史], target=[42,3,67],   loss_mask=仅target
-```
-
-**优势**：
-- 存储层用 Request-wise 压缩（user 特征不重复）
-- 训练层用 NIO 避免冗余 loss 和时序泄漏
-- 两者兼得
-
-#### 9.5.2 Set-wise 存储 + User-Centric 训练
-
-```
-存储层（Set-wise）:
-  每条记录 = 一次请求，含300个候选
-  {
-    "user_id": "U1",
-    "user_sequence": [A, B, X, ...],
-    "candidates": [I₁, I₂, ..., I₃₀₀],
-    "labels": [1, 0, 0, ..., 1],
-  }
-
-训练层（类User-Centric, 但loss在target上）:
-  将用户序列 + 所有候选拼成一条长序列
-  loss_mask: user_sequence段=0, target候选段=1
-```
-
-#### 9.5.3 结合方式对比
-
-| 存储方式 \ 训练方式 | Naive Impression | User-Centric | New Impression Only |
-|:--|:--|:--|:--|
-| **Pointwise** (传统) | ✅ 经典 | ✅ 开源OneRec | ✅ OneRec-V2 |
-| **Request-wise** (Climber式) | ✅ 拆成多条 | ⚠️ 需合并多请求 | ✅ **推荐组合**：存储压缩+NIO无泄漏 |
-| **Set-wise** (HoMer式) | ⚠️ 候选太多效率低 | ⚠️ 需特殊mask | ✅ 候选内仅target有loss |
-
-### 9.6 存储效率对比
-
-不同样本组织方式对存储空间的影响（假设：$U$ 个用户，$N$ 次曝光，$R$ 次请求，平均每次请求 $K$ 个曝光，$C$ 个候选）：
-
-| 样本方式 | 样本条数 | User特征存储次数 | 总存储量级 | 相对Pointwise压缩比 |
-|----------|---------|----------------|-----------|:--:|
-| Pointwise | $N$ | $N$ 次 | $N \times (D_{\text{user}} + D_{\text{item}})$ | 1× |
-| Request-wise | $R = N/K$ | $R$ 次 | $R \times D_{\text{user}} + N \times D_{\text{item}}$ | ~$K$×（user特征部分） |
-| Set-wise | $R$ | $R$ 次 | $R \times D_{\text{user}} + R \times C \times D_{\text{item}}$ | 视$C$而定 |
-| User-Centric | $U$ | $U$ 次 | $U \times D_{\text{user}} + N \times D_{\text{item}}$ | ~$N/U$× |
-
-**具体数值示例**（快手量级）：
-- $U = 4 \times 10^8$ 用户，$N = 10^{10}$ 日曝光，$R = 2 \times 10^9$ 日请求，$K \approx 5$
-- $D_{\text{user}} = 2$KB，$D_{\text{item}} = 500$B
-
-| 方式 | 日存储估算 |
-|------|-----------|
-| Pointwise | $10^{10} \times 2.5\text{KB} \approx 25\text{TB}$ |
-| Request-wise | $2\times10^9 \times 2\text{KB} + 10^{10} \times 0.5\text{KB} \approx 9\text{TB}$ |
-| User-Centric | $4\times10^8 \times 2\text{KB} + 10^{10} \times 0.5\text{KB} \approx 5.8\text{TB}$ |
-
-> **结论**：Request-wise 比 Pointwise 节省约 60% 存储（主要来自 user 特征不重复）；User-Centric 在 GR 场景下最省（但牺牲了流式能力）。
-> **New Impression Only + Request-wise 存储** 是工业界 GR 场景下的最优组合：既省存储又支持流式。
-
-### 9.7 小结
-
-```
-LLM4GRs 样本演进:
-  Naive Impression → User-Centric → New Impression Only
-  (全序列loss,冗余)   (用户级,泄漏)    (仅target loss,流式)
-
-LLM4DLRMs 样本演进:
-  Pointwise → Request-wise/List-wise → Set-wise
-  (单item独立)   (请求级打包,共享user)    (候选级打包,item交互)
-
-两者可以正交组合：
-  存储层选 Request-wise/Set-wise (压缩)
-  ×
-  训练层选 New Impression Only (无泄漏,流式)
-  =
-  工业最优实践
-```
-
----
-
-## 7. Sources / 参考文献（补充）
-
-- [OneRec-V2 Technical Report (arXiv:2508.20900)](https://arxiv.org/abs/2508.20900) — 三种样本组织方式的定义、Figure 3 图示、streaming training 实验设置的出处。
-- [OneRec-V2 HTML 版](https://arxiv.org/html/2508.20900) — §2.1 Design Principles 原文可直接查阅。
-- [HoMer: Addressing Heterogeneities by Modeling Sequential and Set-wise Contexts for CTR Prediction (arXiv:2510.11100)](https://arxiv.org/abs/2510.11100) — 美团，Set-wise 样本组织范式的代表工作。
-- [Climber / ASTRO: An Efficient Large Recommendation Model (arXiv:2502)](https://arxiv.org/abs/2502) — 网易云音乐，Request-wise 样本组织的代表工作。
-- 本仓库开源代码 —— User-Centric 实现的对照参考：
-  - `pretrain/onerec_llm/data/qwen3_dataset.py::_process_completion` (pretrain 全序列 loss)
-  - `pretrain/onerec_llm/data/qwen3_dataset.py::_get_assistant_mask` + `_process_chat` (SFT target-only loss，最接近 NIO)
-  - `data/onerec_data/pretrain/video_rec.py` (User-Centric 样本生成)
-
----
-
-## 8. RL 后训练阶段用不用 0/1 label？—— 不用，用 reward + policy gradient
+## 补.8. RL 后训练阶段用不用 0/1 label？—— 不用，用 reward + policy gradient
 
 RL 阶段（`verl_rl/recipe/onerec/`，GRPO 算法）的样本组织和 loss **和前面三种"pretrain-style"完全不同一层**。它不再最小化下一 token 的 CE，而是最大化"奖励期望"。0/1 二元交叉熵仍然**没有出现**。
 
@@ -775,3 +780,5 @@ row = {
 - RL 阶段的"信号"叫 **reward**，是标量（可能取值恰好为 0/1，也可能是连续值），进入 policy gradient 公式，不是分类 loss。
 - 二分类任务（`label_pred` 的"是/否"）的 0/1 只在**评测阶段**通过 `"是"/"否"` 两个候选 token 的 logprob 反推概率再算 AUC，**训练时 0/1 也从没直接出现在 loss 里**。
 
+## 参考链接
+https://www.huaxiaozhuan.com/applications/recommendation/sequential_recommendation/chapters/2025_OneRecV2_TechReport.html

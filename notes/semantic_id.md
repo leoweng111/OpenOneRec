@@ -38,7 +38,13 @@
   - [9.2 PLUM：LLM适配生成式推荐](#92-plumllm适配生成式推荐)
 - [10. 工业基准](#10-工业基准)
   - [10.1 FORGE：淘宝大规模基准](#101-forge淘宝大规模基准)
-- [11. 总结与展望](#11-总结与展望)
+- [11. 多模态语义ID构造专题](#11-多模态语义id构造专题)
+  - [11.1 问题背景](#111-问题背景)
+  - [11.2 多模态语义ID构造方法分类](#112-多模态语义id构造方法分类)
+  - [11.3 MMQ：阿里MoE混合量化（WWW 2025）](#113-mmq阿里moe混合量化www-2025)
+  - [11.4 与其他多模态方法的对比](#114-与其他多模态方法的对比)
+  - [11.5 何时选择何种方式？](#115-何时选择何种方式)
+- [12. 总结与展望](#12-总结与展望)
 - [参考文献](#参考文献)
 
 ---
@@ -127,6 +133,7 @@ $$\mathcal{L} = \underbrace{\| \mathbf{x} - \hat{\mathbf{x}} \|_2^2}_{\text{重�
 - **前向传播**：$\hat{\mathbf{z}} = \mathbf{e}_{c} $ （离散码字）
 - **反向传播**：$\frac{\partial \mathcal{L}}{\partial \mathbf{z}} \approx \frac{\partial \mathcal{L}}{\partial \hat{\mathbf{z}}}$（直接将梯度复制到encoder输出）
 
+值得注意的是， 这里除了STE的做法，还有一些改进方法，如Gumbel-Softmax、Rotation Trick等，但STE是最常用且简单有效的。
 #### 1.3.5 训练与推理流程示例
 
 **训练阶段（以batch_size=2, d=64, L=3, K=256为例）**：
@@ -195,6 +202,21 @@ LLM4DLRMs方式: 语义ID → 小Embedding Table → 特征拼接 → DNN → CT
 - 训练流程：先离线生成语义ID → 再训练推荐模型
 - **优势**：工业部署改动小，可渐进式迁移
 
+**发展历程**：
+- 最开始的做法是直接将LLM encoder（或者其他多模态encoder）的输出作为额外的dense特征，直接对齐后拼接到下游的DLRM中，比如快手LEARN的做法，比如 
+  e.g. 华为 Towards Open-World Recommendation with Knowledge Augmentation from Large Language Models
+  https://arxiv.org/pdf/2306.10933
+  e.g. 蚂蚁 Enhancing Sequential Recommenders with Augmented Knowledge from Aligned Large Language Models
+  https://dl.acm.org/doi/pdf/10.1145/3626772.3657782
+这些方法生成的LLM embedding/多模态表示总是存储在缓存中，并作为推荐模型的额外固定输入，因此无法通过推荐模型梯度进行更新，对下游训练并不友好。
+因此，一般会把生成的表征过一个参数可学习的网络，然后使用用户交互信号进行对齐，才能在下游推荐模型中使用。
+- 后续有人尝试直接把多模态dense embedding当成普通的ID embedding去梯度更新，相当于拿多模态信息做embedding table的初始化，不过这个方法效果也不好。
+主要是维度太大训不太动，效果也不好，增量训练的模型训几个月llm的世界知识遗忘就和随机初始化一样
+- 再后来，出现了新的做法：将LLM encoder输出的embedding进行量化，得到离散的语义ID，然后在下游推荐模型中使用这些语义ID作为特征输入，比如快手QARM、YouTube Semantic IDs等。
+- 这种做法一般需要做两阶段训练：第一阶段是训练量化器（RQ-VAE、RQ-KMeans等）得到语义ID，第二阶段是训练下游推荐模型使用这些语义ID作为离散特征输入。
+- 语义ID对应的码本是固定的，不会在下游训练中更新，因此可以避免大规模embedding table的存储和计算开销。
+- 但是语义ID对应的embedding是可学习可参数更新的，因此可以在下游DLRM训练中进行微调，从而提升推荐效果。
+- 所以本是上来说，QARM这种做法是将多模态信息等进行了降维，得到离散的语义ID。
 **代表论文概览**：
 
 | 论文 | 链接 | 量化方法 | 生成方式 | 核心贡献 |
@@ -236,7 +258,7 @@ LLM4DLRMs方式: 语义ID → 小Embedding Table → 特征拼接 → DNN → CT
 | [UniSID](#91-unisid广告推荐端到端生成) (2026) | [arXiv:2602.10445](https://arxiv.org/abs/2602.10445) | 端到端 | 串行 | 端到端联合优化embedding和SID |
 | [DIGER](#23-diger可微分语义id) (SIGIR 2026) | [arXiv:2601.19711](https://arxiv.org/abs/2601.19711) | 可微分RQ | 串行 | Gumbel-Softmax可微分量化 |
 | [COBRA](#81-cobra百度级联表示) (百度, 2025) | [arXiv:2503.02453](https://arxiv.org/abs/2503.02453) | 级联 | 级联 | 稀疏语义ID+稠密向量级联 |
-| [MMQ](#44-mmq多模态混合量化) (WSDM 2026) | [arXiv:2508.15281](https://arxiv.org/abs/2508.15281) | MoE | 并行 | 多模态专家混合量化 |
+| [MMQ](#44-mmq多模态混合量化) (WSDM 2026) | [arXiv:2502.16077](https://arxiv.org/abs/2502.16077) | MoE | 并行 | 多模态专家混合量化 |
 
 #### 1.4.3 两种范式对比
 
@@ -416,6 +438,8 @@ RQ-VAE = Encoder（神经网络） + 残差量化（最近邻查找） + Decoder
 $$c_l = \text{Gumbel-Softmax}(\text{logits}_l, \tau)$$
 
 其中温度 $\tau$ 随训练逐步降低，从探索过渡到利用。推荐损失可以直接优化语义ID的生成。
+
+DIGER实现了基于语义ID的生成式推荐从双阶段训练到端到端联合优化的过渡。
 
 ---
 
@@ -697,7 +721,7 @@ for m in range(M):
 |------|----------|----------|----------|
 | [VQ-Rec](https://arxiv.org/abs/2210.12316) (2022) | LLM4DLRMs/预训练 | 并行(PQ) | 可迁移序列推荐 |
 | [SIDE](https://arxiv.org/abs/2506.16698) (Meta, 2025) | LLM4DLRMs | 并行(VQ) | 无参数SID转换，广告序列 |
-| [MMQ](https://arxiv.org/abs/2508.15281) (2025) | LLM4GRs | 并行(MoE) | 多模态专家混合量化 |
+| [MMQ](https://arxiv.org/abs/2502.16077) (2025) | LLM4GRs | 并行(MoE) | 多模态专家混合量化 |
 
 ### 4.2 VQ-Rec：可迁移序列推荐
 
@@ -753,9 +777,9 @@ for m in range(M):
 
 ### 4.4 MMQ：多模态混合量化
 
-- **标题**：[MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation](https://arxiv.org/abs/2508.15281)
+- **标题**：[MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation](https://arxiv.org/abs/2502.16077)
 - **发表**：WSDM 2026
-- **arXiv**：https://arxiv.org/abs/2508.15281
+- **arXiv**：https://arxiv.org/abs/2502.16077
 - **使用范式**：**LLM4GRs**
 - **构造范式**：**并行**（MoE混合量化）
 
@@ -950,7 +974,7 @@ $$\mathcal{L}_{\text{RPG}} = \mathcal{L}_{\text{OPQ}} + \lambda \mathcal{L}_{\te
 
 ## 7. 协同对齐方法
 
-**核心问题**：语义ID从内容特征量化而来，只包含内容语义，不包含协同过滤信号（用户-物品交互模式）。这导致语义ID与推荐目标不一致。
+**核心问题**：语义ID从内容特征量化而来，只包含内容语义，不包含协同过滤信号（用户-物品交互模式）。这导致语义ID与推荐目标不一致。（LLM文本知识空间和推荐系统协同空间）
 
 ### 采用协同对齐方法的论文
 
@@ -1097,9 +1121,169 @@ $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i
 
 ---
 
-## 11. 总结与展望
+## 11. 多模态语义ID构造专题
 
-### 11.1 方法全景分类
+### 11.1 问题背景
+
+当物品的语义信息涉及**多种模态**（如文本、图片、音频、视频等）时，如何将这些模态的embedding融合后量化为语义ID，是一个关键问题。
+
+**朴素方法：直接拼接（Concat）**
+
+最简单的做法是将各模态embedding直接拼接后做量化：
+
+```python
+# 朴素拼接
+text_emb: shape [B, d_text]        # e.g., d_text = 768
+img_emb:  shape [B, d_img]         # e.g., d_img = 512
+
+concat_emb = torch.cat([text_emb, img_emb], dim=-1)  # shape: [B, 1280]
+
+# 直接对拼接向量做RQ-VAE量化
+semantic_id = rq_vae(concat_emb)   # shape: [B, L]
+```
+
+**朴素方法的问题**：
+- **模态主导**：某一模态（如文本）的embedding方差可能远大于另一模态（如图片），导致量化过程被单一模态主导
+- **模态冲突**：不同模态的语义空间可能不一致（如图片描述外观，文本描述功能），直接拼接导致语义模糊
+- **码本冲突加剧**：语义空间混乱使得不同物品可能被量化到相同的码字
+- **忽略模态独特性**：每个模态的独特信息在拼接后被稀释
+
+### 11.2 多模态语义ID构造方法分类
+
+| 方法 | 代表论文 | 核心思路 | 优势 |
+|------|----------|----------|------|
+| **直接拼接** | TIGER, 早期工作 | concat所有模态 → 统一量化 | 简单，实现方便 |
+| **跨模态量化** | MACRec | 模态间交叉注意力 → 联合量化 | 捕获模态交互 |
+| **MoE混合量化** | MMQ (阿里) | 多专家路由 → 模态分离/共享 | 兼顾模态独特性与协同性 |
+| **多模态融合VQ** | SIDE (Meta) | VQ-Fusion多任务 | 融合多种内容信号 |
+| **行为感知微调** | MMQ, DAS | 量化后用行为数据微调 | 弥合语义-行为gap |
+
+### 11.3 MMQ：阿里MoE混合量化（WWW 2025）
+
+- **标题**：[MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation](https://arxiv.org/abs/2502.16077)
+- **机构**：阿里巴巴
+- **发表**：WSDM 2026 / arXiv 2025年2月
+- **使用范式**：**LLM4GRs**
+- **构造范式**：**并行**（MoE多专家混合量化）
+
+#### 11.3.1 核心思想
+
+MMQ的核心创新在于：**不是简单拼接多模态embedding，而是用Mixture-of-Experts（MoE）架构同时捕获模态间的协同信息和各模态的独特信息**。
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     MMQ 两阶段架构                            │
+│                                                              │
+│  Stage 1: 多模态共享-特定 Tokenizer 训练                      │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │                                                      │    │
+│  │  text_emb ──→ Router ──┬→ Expert_text (文本特定码本)  │    │
+│  │                        │                              │    │
+│  │  img_emb  ──→ Router ──┼→ Expert_img  (图片特定码本)  │    │
+│  │                        │                              │    │
+│  │  concat   ──→ Router ──┼→ Expert_shared (共享码本)    │    │
+│  │                        │                              │    │
+│  │            正交正则化 → └→ 各专家输出加权聚合           │    │
+│  │                                  ↓                    │    │
+│  │                          多模态语义ID                   │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                              │
+│  Stage 2: 行为感知微调                                        │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  语义ID + 推荐目标 → 动态调整码本聚类                   │    │
+│  │  + 多模态重构损失（保持模态信息不丢失）                  │    │
+│  └──────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 11.3.2 多专家架构详解
+
+**Expert设计**：
+- **Modality-Specific Experts**（模态特定专家）：每个模态有专属的量化专家和码本，捕获该模态的独特语义
+- **Modality-Shared Experts**（模态共享专家）：跨模态的共享专家，捕获模态间的协同语义
+
+**Router机制**：
+
+```python
+# 输入: text_emb [B, d_text], img_emb [B, d_img]
+
+# 1. 各模态经过各自的专家
+text_out = expert_text(text_emb)     # shape: [B, d_hidden]
+img_out  = expert_img(img_emb)       # shape: [B, d_hidden]
+
+# 2. 拼接后经过共享专家
+shared_input = cat([text_emb, img_emb])  # shape: [B, d_text + d_img]
+shared_out = expert_shared(shared_input)  # shape: [B, d_hidden]
+
+# 3. Router分配权重
+router_logits = router(cat([text_emb, img_emb]))  # shape: [B, 3]
+router_weights = softmax(router_logits)            # shape: [B, 3]
+
+# 4. 加权聚合
+output = (router_weights[:, 0:1] * text_out +
+          router_weights[:, 1:2] * img_out +
+          router_weights[:, 2:3] * shared_out)      # shape: [B, d_hidden]
+
+# 5. 对聚合输出做量化
+semantic_id = quantize(output)                      # shape: [B, L]
+```
+
+#### 11.3.3 正交正则化
+
+为了防止所有Expert退化为相同的行为（expert collapse），MMQ引入**正交正则化**：
+
+$$\mathcal{L}_{\text{orth}} = \| \mathbf{W}_i^T \mathbf{W}_j \|_F^2 \quad (i \neq j)$$
+
+其中 $\mathbf{W}_i$, $\mathbf{W}_j$ 是不同Expert的权重矩阵。正交约束迫使各Expert学习不同的表示子空间，确保模态特定专家和共享专家各司其职。
+
+**总损失**：
+
+$$\mathcal{L}_{\text{MMQ}} = \mathcal{L}_{\text{quant}} + \lambda_1 \mathcal{L}_{\text{recon}} + \lambda_2 \mathcal{L}_{\text{orth}}$$
+
+其中 $\mathcal{L}_{\text{quant}}$ 是量化损失（码本+承诺），$\mathcal{L}_{\text{recon}}$ 是重构损失，$\mathcal{L}_{\text{orth}}$ 是正交正则化。
+
+#### 11.3.4 行为感知微调（Stage 2）
+
+第一阶段训练的语义ID仅基于内容语义，与推荐目标存在gap。MMQ在第二阶段用下游推荐任务微调：
+
+```
+语义ID (冻结码本) + 用户行为数据
+    ↓
+推荐损失 (NTP / BCE) 反向传播
+    ↓
+动态调整: 码本中的聚类中心
+    ↓
+同时保持多模态重构损失 (防止模态信息丢失)
+```
+
+**关键创新**：不是简单冻结码本，而是**动态调整语义ID的聚类**，使得行为相似的物品即使内容不同也能获得相近的语义ID。
+
+### 11.4 与其他多模态方法的对比
+
+| 维度 | 直接拼接 | MMQ (MoE) | MACRec (跨模态) | SIDE (VQ-Fusion) |
+|------|----------|-----------|----------------|------------------|
+| 模态融合方式 | concat | 多专家路由 | 交叉注意力 | 多任务VQ |
+| 模态独特性 | ❌ 被稀释 | ✅ 特定Expert保留 | ✅ 模态级对齐 | ✅ 多任务分离 |
+| 模态协同性 | ⚠️ 隐式 | ✅ 共享Expert | ✅ 显式交叉 | ⚠️ 隐式 |
+| 行为适配 | ❌ | ✅ Stage 2 | ✅ 多维对齐 | ❌ |
+| 码本冲突缓解 | ❌ | ✅ 正交正则化 | ✅ 跨模态量化 | ✅ DPCA |
+| 计算开销 | 低 | 中 | 中 | 低 |
+
+### 11.5 何时选择何种方式？
+
+```
+模态数量少（2~3个）且语义一致 → 直接拼接（简单有效）
+模态差异大、需要保留各模态独特性 → MMQ (MoE混合量化)
+需要模态间显式交互/对齐 → MACRec (跨模态量化)
+需要融合非模态信号（如类别预测） → SIDE (VQ-Fusion)
+语义ID需要适配推荐行为 → MMQ Stage 2 / DAS 行为对齐
+```
+
+---
+
+## 12. 总结与展望
+
+### 12.1 方法全景分类
 
 #### 按量化方法分类
 
@@ -1107,7 +1291,8 @@ $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i
 |----------|----------|----------|----------|----------|
 | **RQ-VAE** | TIGER, YouTube, DIGER | GRs/DLRMs | 串行 | 端到端优化，层次语义 |
 | **RQ-KMeans** | QARM, QARM V2, OneRec | DLRMs/GRs | 串行 | 轻量，码本均衡 |
-| **VQ/PQ** | VQ-Rec, SIDE, MMQ | DLRMs/GRs | 并行 | 推理快，可迁移 |
+| **VQ/PQ** | VQ-Rec, SIDE | DLRMs | 并行 | 推理快，可迁移 |
+| **MoE混合量化** | MMQ (阿里) | GRs | 并行 | 多模态分离/协同，行为适配 |
 | **OPQ** | RPG | GRs | 并行 | 优化子空间，一步解码 |
 | **RQ-OPQ** | OneSearch | GRs | 混合 | 层次+效率 |
 | **双对齐** | DAS | DLRMs/GRs | 兼容多种 | 注入协同信号 |
@@ -1120,6 +1305,7 @@ $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i
 |------|----------|----------|
 | 冷启动泛化 | 语义ID替代随机ID | TIGER, YouTube |
 | 多模态对齐 | Item Alignment + 量化 | QARM, QARM V2 |
+| **多模态融合** | **MoE混合量化/跨模态量化** | **MMQ, MACRec** |
 | 推理延迟 | 并行/混合生成 | RPG, OneSearch |
 | 目标不一致 | 可微分/端到端量化 | DIGER, UniSID |
 | 码本冲突 | FSQ混合量化 | QARM V2 |
@@ -1127,8 +1313,9 @@ $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i
 | 信息损失 | 稀疏+稠密级联 | COBRA |
 | 缺乏协同信号 | 双对齐/CF注入 | DAS |
 | 码本不均衡 | 多级别衡量化 | OneRec |
+| **语义-行为gap** | **行为感知微调** | **MMQ, DAS** |
 
-### 11.2 未来方向
+### 12.2 未来方向
 
 1. **端到端统一**：语义ID生成与推荐模型的端到端联合优化（DIGER、UniSID的方向）
 2. **多模态深度融合**：更深度的多模态信息编码（MMQ的MoE方式）
@@ -1174,11 +1361,13 @@ $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i
 
 16. COBRA Team, Baidu. (2025). Unified Generative Recommendations with Cascaded Sparse-Dense Representations. arXiv:2503.02453. https://arxiv.org/abs/2503.02453
 
-17. MMQ Team. (2025). MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation. *WSDM 2026*. arXiv:2508.15281. https://arxiv.org/abs/2508.15281
+17. Xu, et al. (2025). MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation. *WSDM 2026*. arXiv:2502.16077. https://arxiv.org/abs/2502.16077
 
-18. FORGE Team, Alibaba. (2025). FORGE: Forming Semantic Identifiers for Generative Retrieval in Industrial Datasets. arXiv:2509.20904. https://arxiv.org/abs/2509.20904
+18. MACRec Team. (2025). Multi-Aspect Cross-modal Quantization for Generative Recommendation. arXiv:2511.15122. https://arxiv.org/abs/2511.15122
 
-19. van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). Neural Discrete Representation Learning (VQ-VAE). *NeurIPS 2017*. arXiv:1711.00937. https://arxiv.org/abs/1711.00937
+19. FORGE Team, Alibaba. (2025). FORGE: Forming Semantic Identifiers for Generative Retrieval in Industrial Datasets. arXiv:2509.20904. https://arxiv.org/abs/2509.20904
+
+20. van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). Neural Discrete Representation Learning (VQ-VAE). *NeurIPS 2017*. arXiv:1711.00937. https://arxiv.org/abs/1711.00937
 
 20. Lee, K., Barnes, C., & Kim, J. (2022). Autoregressive Image Generation using Residual Quantization. *CVPR 2022*. arXiv:2203.01941. https://arxiv.org/abs/2203.01941
 
