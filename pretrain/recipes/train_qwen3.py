@@ -1,5 +1,16 @@
 """Qwen3 训练主脚本（Pretrain / Stage1 / Stage2 / SFT 通用入口）。
 
+OneRec 不是从零重训一个全新 LLM；它是在 Qwen3 预训练语言能力 上，增加一套“item 离散语义 token”，让同一个自回归模型能同时处理文本和 item 序列。
+所以要读取 Qwen3 参数，是为了“继承语言与推理能力”，而不是从头学一遍。
+不读就等于从零训一个大模型，代价和风险都非常高：
+训练成本爆炸（数据量、算力、时间）
+语言理解与生成能力无法快速达到现有水平
+推荐任务中的文本理解（query、上下文、解释）会弱很多
+读取 Qwen3 参数的价值：
+继承成熟语言能力
+只增量学习 item token 的语义对齐（Stage1）
+再做全参数协同训练（Stage2/SFT），把推荐能力叠加上去
+
 功能：使用 FSDP（Fully Sharded Data Parallel）在多节点多 GPU 上训练/微调
     OneRec 的 Qwen3 因果语言模型。同一份脚本通过参数区分三个训练阶段：
       * Stage 1（Itemic-Text Alignment）：加 `--freeze_llm` 且
@@ -23,6 +34,30 @@
     3. shift labels: labels = concat(input_ids[:, 1:], pad)，(1, T)
     4. labels = labels * loss_mask + ignore_index * (1 - loss_mask)  → 只在有效位置算 loss
     5. CrossEntropyLoss → scalar loss + per_token_loss (T,)
+
+这里第一维是 1，是因为这套数据加载走的是 packed sequence + 单条拼接样本 设计。
+计划：
+ 先解释为什么 B=1
+ 再解释吞吐量并没有真的变小
+ 说明 cu_seqlens 在这里的角色
+
+在 pretrain/recipes/train_qwen3.py 的注释里，batch 形状写成 (1, T)，本质是：
+不是“一个原始样本”
+而是“一个打包后的长序列容器”
+也就是把很多短样本拼到一条长 token 流里，形成一个 super-sequence，所以外层 batch 维记为 1。
+为什么这么做？
+减少 padding 浪费（短样本多时很有效）
+更好利用 FlashAttention 的变长能力
+训练吞吐通常更高
+那真正的样本数在哪里？
+在 cu_seqlens：
+形状 (S+1,)
+表示这条长序列里有 S 个子样本边界
+代码里也有：num_samples = len(cu_seqlens) - 1
+所以“有效 batch size”更接近 S（再乘并行卡数），不是第一维那个 1。
+一句话总结：
+第一维是 1 不代表一条训练样本，而是“一个 packed 容器”；真正的多样本信息由 cu_seqlens（以及 sample_idx）承载。
+其实就是把原本Batch的维度和序列T的维度拼接在了一起，共同作为T维度
 
 关键上游/下游：
     - 上游：base_model_dir 必须是 `pretrain/tools/model_converter/expand_qwen3_vocab.py`
@@ -487,10 +522,12 @@ def initialize_model(
     """
     # Create model on meta device
     with set_default_dtype(torch.bfloat16), torch.device("meta"), init_empty_weights():
+        # model_dir中报案后能够的是扩充过itemic token的Qwen3模型，config中会包含新的词表大小和embedding维度
         config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
         config._attn_implementation = "flash_attention_2"
         config.use_cache = False
         config.chunked_loss_computer = args.use_chunked_loss_computer
+        # eval读取实际模型类，进行模型对象初始化，这里model_class在所有stage都是Qwen3ForCausalLM
         model = eval(args.model_class)(config)
     
     # Verify all parameters are on meta device
@@ -730,7 +767,7 @@ def compute_forward_backward(
 
     关键流程：
         1) 将 input_ids 中 <=0 的位置置 0（避免作为无效 label 传入 embedding 查表）。
-        2) forward: logits = (1, T, V)。
+        2) forward: logits = (1, T, V)。V是扩充SID token后的词表大小，约176k。
         3) shift labels：把 input_ids[:, 1:] 作为下一 token 的目标；末位补一个 ignore_index。
         4) 用 loss_mask 屏蔽非监督位置 → labels 中该位置置 ignore_index=-100。
         5) 计算 loss（可选 ChunkedLossComputer，把 lm_head 沿 seq 维分片以省显存）。
@@ -775,7 +812,7 @@ def compute_forward_backward(
             position_ids=position_ids,
         )
         
-        logits = output.logits
+        logits = output.logits  # (1, T, V)
         
         # Shift labels for next token prediction
         # For causal LM, we predict token[i] given tokens[0:i], so labels need to be shifted
@@ -785,11 +822,14 @@ def compute_forward_backward(
             loss_fn.ignore_index,
             dtype=input_ids.dtype
         ).to(device=input_ids.device, non_blocking=True)
+        # Teacher forcing: use input_ids[:, 1:] as labels, pad the last position with ignore_index
         labels = torch.cat([input_ids[:, 1:], pad], dim=-1)
         # Update labels: use input_ids where loss_mask==1, ignore_index where loss_mask==0
         # This allows selective loss computation on specific tokens (e.g., excluding special tokens)
         labels = labels * loss_mask + loss_fn.ignore_index * (1 - loss_mask)
-        
+
+        # 这里就是LLM的NTP的经典交叉熵损失
+        # 注意这里是在全部176k的扩充后的token上计算softmax的，而不仅仅在新增的SID token上计算
         loss, per_token_loss = compute_loss_fn(logits, labels=labels)
         per_token_loss = per_token_loss.to(loss.device)
     
@@ -800,6 +840,7 @@ def compute_forward_backward(
         # Apply gradient mask for embedding layers if needed
         # When start_optimize_embedding_index > 0, only embeddings with index >= threshold are trainable
         # This allows progressive unfreezing of embeddings during training
+        # start_optimize_embedding_index参数是在预训练的stage1中使用的，目的是只训练embedding中index大于阈值的SID token embedding，其他embedding保持冻结状态
         if args.start_optimize_embedding_index > 0 and embedding_masker is not None:
             embedding_masker.apply_gradient_mask(optimizer)
         
@@ -1162,6 +1203,7 @@ def train():
     dist.barrier()
     
     # Load tokenizer
+    # 从 args.model_dir 加载该模型对应的分词器配置与词表（包括扩展过的 itemic token）。
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     
     # Save dataset configuration
@@ -1189,6 +1231,7 @@ def train():
     )
     
     # Initialize loss function
+    # 就是交叉熵损失，写得太复杂了这里。。。
     loss_fn = CrossEntropyLoss(
         ignore_index=-100, return_token_loss=True, shift_labels=False
     )
@@ -1242,6 +1285,7 @@ def train():
             # Sleep based on rank to stagger output and make logs easier to read
             if remaining_debug_samples > 0 and dist.get_rank() <= 8:
                 with Timer("Show data"):
+                    # 把一条样本的 token id 序列反解成人可读字符串，主要用于 debug 打印。
                     input_text = tokenizer.decode(batch['input_ids'][0])
                     # Stagger output by rank to avoid interleaved prints (0.3s per rank)
                     time.sleep(float(dist.get_rank()) * 0.3)

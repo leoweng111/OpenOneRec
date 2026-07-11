@@ -19,10 +19,11 @@
   - [3.3 QARM V2：混合FSQ量化](#33-qarm-v2混合fsq量化)
   - [3.4 OneRec：快手统一生成式推荐](#34-onerec快手统一生成式推荐)
 - [4. VQ/PQ方法（向量量化/乘积量化）](#4-vqpq方法向量量化乘积量化)
-  - [4.1 PQ原理与公式](#41-pq原理与公式)
-  - [4.2 VQ-Rec：可迁移序列推荐](#42-vq-rec可迁移序列推荐)
-  - [4.3 SIDE：Meta广告序列学习](#43-side-meta广告序列学习)
-  - [4.4 MMQ：多模态混合量化](#44-mmq多模态混合量化)
+  - [4.1 VQ原理与公式](#41-vq原理与公式)
+  - [4.2 PQ原理与公式](#42-pq原理与公式)
+  - [4.3 VQ-Rec：可迁移序列推荐](#43-vq-rec可迁移序列推荐)
+  - [4.4 SIDE：Meta广告序列学习](#44-side-meta广告序列学习)
+  - [4.5 MMQ：多模态混合量化](#45-mmq多模态混合量化)
 - [5. OPQ方法（优化乘积量化 · 并行）](#5-opq方法优化乘积量化--并行)
   - [5.1 OPQ原理与公式](#51-opq原理与公式)
   - [5.2 RPG：Meta并行语义ID生成](#52-rpgmeta并行语义id生成)
@@ -203,20 +204,58 @@ LLM4DLRMs方式: 语义ID → 小Embedding Table → 特征拼接 → DNN → CT
 - **优势**：工业部署改动小，可渐进式迁移
 
 **发展历程**：
-- 最开始的做法是直接将LLM encoder（或者其他多模态encoder）的输出作为额外的dense特征，直接对齐后拼接到下游的DLRM中，比如快手LEARN的做法，比如 
-  e.g. 华为 Towards Open-World Recommendation with Knowledge Augmentation from Large Language Models
-  https://arxiv.org/pdf/2306.10933
-  e.g. 蚂蚁 Enhancing Sequential Recommenders with Augmented Knowledge from Aligned Large Language Models
-  https://dl.acm.org/doi/pdf/10.1145/3626772.3657782
-这些方法生成的LLM embedding/多模态表示总是存储在缓存中，并作为推荐模型的额外固定输入，因此无法通过推荐模型梯度进行更新，对下游训练并不友好。
-因此，一般会把生成的表征过一个参数可学习的网络，然后使用用户交互信号进行对齐，才能在下游推荐模型中使用。
-- 后续有人尝试直接把多模态dense embedding当成普通的ID embedding去梯度更新，相当于拿多模态信息做embedding table的初始化，不过这个方法效果也不好。
-主要是维度太大训不太动，效果也不好，增量训练的模型训几个月llm的世界知识遗忘就和随机初始化一样
-- 再后来，出现了新的做法：将LLM encoder输出的embedding进行量化，得到离散的语义ID，然后在下游推荐模型中使用这些语义ID作为特征输入，比如快手QARM、YouTube Semantic IDs等。
-- 这种做法一般需要做两阶段训练：第一阶段是训练量化器（RQ-VAE、RQ-KMeans等）得到语义ID，第二阶段是训练下游推荐模型使用这些语义ID作为离散特征输入。
-- 语义ID对应的码本是固定的，不会在下游训练中更新，因此可以避免大规模embedding table的存储和计算开销。
-- 但是语义ID对应的embedding是可学习可参数更新的，因此可以在下游DLRM训练中进行微调，从而提升推荐效果。
-- 所以本是上来说，QARM这种做法是将多模态信息等进行了降维，得到离散的语义ID。
+
+> LLM4DLRMs中使用多模态/LLM表征经历了三个阶段的演进：
+
+**阶段一：冻结Dense特征直接拼接（早期）**
+
+将LLM encoder（或多模态encoder）的输出作为额外的dense特征，对齐后直接拼接到下游DLRM中。
+
+```
+LLM Encoder (frozen) → dense_emb ∈ R^d → 缓存 → 拼接到DLRM输入
+```
+
+- **代表工作**：
+  - 华为 [Towards Open-World Recommendation with Knowledge Augmentation from Large Language Models](https://arxiv.org/abs/2306.10933) (arXiv:2306.10933)
+  - 蚂蚁 [Enhancing Sequential Recommenders with Augmented Knowledge from Aligned Large Language Models](https://dl.acm.org/doi/10.1145/3626772.3657782) (SIGIR 2024)
+- **问题**：
+  - LLM embedding存储在缓存中，作为**固定输入**，无法通过推荐模型梯度更新
+  - 需要先过一个参数可学习的对齐网络，再用用户交互信号对齐，才能在下游使用
+  - 对下游训练不友好，表征与推荐目标存在gap
+
+**阶段二：多模态Embedding作为ID初始化（中期尝试）**
+
+直接将多模态dense embedding当成普通ID embedding去梯度更新，相当于用多模态信息做embedding table的初始化。
+
+```
+多模态embedding ∈ R^d → 作为Embedding Table初始值 → 端到端梯度更新
+```
+
+- **问题**：
+  - 维度太大（$d=768$~$4096$），训练难以有效更新
+  - 增量训练几个月后，LLM的世界知识遗忘殆尽，效果退化为与随机初始化相当
+  - 存储和计算开销大
+
+**阶段三：量化为离散语义ID（当前主流）** ✅
+
+将LLM encoder输出的embedding进行**量化**，得到离散的语义ID，然后在下游推荐模型中使用语义ID作为特征输入。
+
+```
+LLM Encoder → dense_emb ∈ R^d → 量化器(RQ-VAE/RQ-KMeans) → 语义ID (c₁, c₂, ..., c_L)
+                                                                  ↓
+                                                     SID Embedding Table (可学习)
+                                                                  ↓
+                                                     拼接到DLRM → CTR预估
+```
+
+- **代表工作**：[QARM](https://arxiv.org/abs/2411.11739)（快手）、[YouTube Semantic IDs](https://arxiv.org/abs/2306.08121)（Google）、[SIDE](https://arxiv.org/abs/2506.16698)（Meta）
+- **两阶段训练**：
+  1. **第一阶段**：训练量化器（RQ-VAE、RQ-KMeans等），得到物品的语义ID
+  2. **第二阶段**：训练下游推荐模型，使用语义ID作为离散特征输入
+- **关键特性**：
+  - 语义ID对应的**码本是固定的**，不在下游训练中更新 → 避免大规模embedding table的存储/计算开销
+  - 语义ID对应的**embedding是可学习的** → 可在下游DLRM训练中微调，提升推荐效果
+- **本质**：将高维多模态信息进行**降维离散化**，得到紧凑的语义ID，兼顾信息压缩和可训练性
 **代表论文概览**：
 
 | 论文 | 链接 | 量化方法 | 生成方式 | 核心贡献 |
@@ -677,9 +716,55 @@ def balanced_residual_kmeans(embeddings, L, K, balance_weight=α):
 ## 4. VQ/PQ方法（向量量化/乘积量化）
 
 **方法分类**：并行语义ID
-**核心原理**：将向量切分为多个子空间，各子空间独立量化，一步并行生成所有token。
+**核心原理**：VQ将整个向量映射到最近码字；PQ将向量切分为多个子空间，各子空间独立量化，一步并行生成所有token。
 
-### 4.1 PQ原理与公式
+### 4.1 VQ原理与公式
+
+**VQ（Vector Quantization，向量量化）** 是最基础的量化方法：将整个 $d$ 维向量直接映射到码本中距离最近的码字。
+
+```
+z ∈ R^d → 码本 C = {e₀, e₁, ..., e_{K-1}}  (K个码字, 每个d维)
+              ↓
+       c = argmin_k ||z - e_k||₂
+              ↓
+       语义ID = c   ← 单个token (或配合RQ得到多个token)
+```
+
+**VQ-VAE的损失函数**（参考[原始论文](https://arxiv.org/abs/1711.00937)）：
+
+$$\mathcal{L}_{\text{VQ}} = \underbrace{\|\mathbf{x} - \hat{\mathbf{x}}\|_2^2}_{\text{重构损失}} + \underbrace{\|\text{sg}(\mathbf{z}) - \mathbf{e}\|_2^2}_{\text{码本损失}} + \underbrace{\beta \|\mathbf{z} - \text{sg}(\mathbf{e})\|_2^2}_{\text{承诺损失}}$$
+
+**代码示例**（参考QARM中的VQ实现）：
+
+```python
+# 输入: z shape [B, d], 码本 codebook shape [K, d]
+
+# 1. 计算距离
+dist = cdist(z, codebook)             # shape: [B, K]
+
+# 2. 找最近码字
+codes = dist.argmin(dim=-1)            # shape: [B]
+quantized = codebook[codes]            # shape: [B, d]
+
+# 3. 损失计算
+recon_loss = MSE(decoder(quantized), x)                        # 重构损失
+codebook_loss = MSE(sg(z), quantized)                          # 码本损失: 码字靠近encoder输出
+commitment_loss = MSE(z, sg(quantized))                        # 承诺损失: encoder输出靠近码字
+
+loss = recon_loss + codebook_loss + β * commitment_loss        # β通常=0.25
+
+# 4. 前向传播用STE (Straight-Through Estimator)
+# forward:  output = quantized (离散码字)
+# backward: gradient直接复制到z (跳过argmin)
+output = z + sg(quantized - z)        # 前向=quantized, 反向梯度=z
+```
+
+**VQ的局限**：单个VQ只能产生1个token（$K$ 种可能），表达能力有限。因此在推荐中通常配合以下策略使用：
+- **RQ（残差量化）**：多层VQ逐层量化残差 → RQ-VAE（TIGER等）
+- **PQ（乘积量化）**：多个子空间各自VQ → 并行多token（VQ-Rec等）
+- **VQ-Fusion**：多任务VQ融合多源信号 → 单一语义ID（SIDE等）
+
+### 4.2 PQ原理与公式
 
 **PQ（Product Quantization，乘积量化）** 将 $d$ 维向量**切分**为 $M$ 个子空间，每个子空间独立量化：
 
@@ -723,7 +808,7 @@ for m in range(M):
 | [SIDE](https://arxiv.org/abs/2506.16698) (Meta, 2025) | LLM4DLRMs | 并行(VQ) | 无参数SID转换，广告序列 |
 | [MMQ](https://arxiv.org/abs/2502.16077) (2025) | LLM4GRs | 并行(MoE) | 多模态专家混合量化 |
 
-### 4.2 VQ-Rec：可迁移序列推荐
+### 4.3 VQ-Rec：可迁移序列推荐
 
 - **标题**：[Learning Vector-Quantized Item Representation for Transferable Sequential Recommenders](https://arxiv.org/abs/2210.12316)
 - **作者**：Yupeng Hou, Shanlei Mu, Wayne Xin Zhao 等
@@ -747,7 +832,7 @@ for m in range(M):
 - 增强对比预训练 + 跨域微调
 - 解耦文本特征和物品表示
 
-### 4.3 SIDE：Meta广告序列学习
+### 4.4 SIDE：Meta广告序列学习
 
 - **标题**：[SIDE: Semantic ID Embedding for effective learning from sequences](https://arxiv.org/abs/2506.16698)
 - **机构**：Meta Platforms
@@ -775,7 +860,7 @@ for m in range(M):
 
 **效果**：归一化熵增益提升2.4倍，数据占用减少3倍。
 
-### 4.4 MMQ：多模态混合量化
+### 4.5 MMQ：多模态混合量化
 
 - **标题**：[MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation](https://arxiv.org/abs/2502.16077)
 - **发表**：WSDM 2026
@@ -990,6 +1075,7 @@ $$\mathcal{L}_{\text{RPG}} = \mathcal{L}_{\text{OPQ}} + \lambda \mathcal{L}_{\te
 - **arXiv**：https://arxiv.org/abs/2508.10584
 - **使用范式**：**LLM4DLRMs / LLM4GRs**（兼容判别式和生成式推荐）
 - **构造范式**：兼容多种量化方法
+- **参考讲解**：https://zhuanlan.zhihu.com/p/1943035654511494581
 
 **DAS架构**：
 
@@ -1029,7 +1115,7 @@ $$\mathcal{L}_{\text{RPG}} = \mathcal{L}_{\text{OPQ}} + \lambda \mathcal{L}_{\te
 $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i}} + \mathcal{L}_{\text{co-occur}}$$
 
 **关键创新**：
-- **一阶段训练**：量化和对齐同时优化，避免两阶段方法的信息损失
+- **一阶段训练**：端到端联合训练CF模型和SID量化模型，量化和对齐同时优化，避免两阶段方法的信息损失
 - **灵活性**：兼容各种量化方法（RQ-VAE、Res-KMeans等）和CF方法
 - 已在快手广告系统部署，服务4亿日活用户
 

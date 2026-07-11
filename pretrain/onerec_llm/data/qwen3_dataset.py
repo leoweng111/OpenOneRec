@@ -1,19 +1,44 @@
 """Qwen3 的训练数据集与 sample packing。
 
+本模块实现了 OneRec 预训练的数据加载核心逻辑，支持两种数据格式和高效的 sample packing。
+
+类的继承关系：
+    IterableDataset (PyTorch 基类)
+        ├── Qwen3ChatCompletionDataset    — 核心处理逻辑（tokenize、loss_mask、sample packing）
+        └── Qwen3ChatCompletionParquetDataset — 实际使用的入口类，管理 parquet 文件列表和 epoch
+
 数据流概览：
     parquet 文件（含 `messages` 或 `segments` 字段，格式见 `data/README.md`）
       ↓ Qwen3NaiveParquetDataset：分片到各 rank/worker，读一行、做 local shuffle
       ↓ Qwen3ChatCompletionParquetDataset._process：
-            - chat 模式：apply_chat_template → tokenize；loss_mask 只在 assistant 段=1
+            - chat 模式（messages）：apply_chat_template → tokenize；loss_mask 只在 assistant 段=1
             - segments 模式：拼接 text → tokenize；loss_mask 全 1（除末尾 EOS）
       ↓ __iter__：把多个样本拼接（sample packing）填满 max_length
       ↓ collate → 每个 batch 是一条长度 ≈ max_length 的"打包序列"
 
+两种数据格式：
+    1. segments 格式（预训练阶段的主要格式）：
+       - 用于推荐数据（视频序列、物品理解、用户画像）和通用文本数据
+       - 直接拼接所有 segment 的 text，loss_mask 全 1（除 EOS）
+       - 示例：视频推荐序列 "<|sid_begin|><s_a_340>...<|sid_end|>"
+
+    2. messages 格式（SFT 阶段的主要格式）：
+       - 用于对话/指令数据，包含 user/assistant 多轮对话
+       - 通过 apply_chat_template 转换，loss_mask 只在 assistant 回复段 = 1
+       - 示例：[{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+
+Sample Packing（样本拼接）：
+    核心加速手段：把多个短样本沿 sequence 维度拼接成一条长序列（~max_length），
+    配合 FlashAttention 的 cu_seqlens 变长 attention，避免 padding 浪费。
+
+    例如：3 条长度分别为 500、800、700 的样本 → 拼接成一条 2000 长度的序列
+    cu_seqlens = [0, 500, 1300, 2000] 记录每个样本的边界
+
 产出 batch（供 recipes/train_qwen3.py 使用）：
-    input_ids       (1, T)  T = ceil(max_length/8)*8 + 64
-    position_ids    (1, T)  每条子样本内部从 0 开始（除非 full_attention=True）
-    loss_mask       (1, T)  1=计 loss，0=忽略
-    itemic_id_mask  (1, T)  1=该 token 是 Itemic Token（id 落在 itemic_id_range 里）
+    input_ids       (1, T)  T = ceil(max_length/8)*8 + 64，token ID 序列
+    position_ids    (1, T)  位置编码，每条子样本内部从 0 开始（除非 full_attention=True）
+    loss_mask       (1, T)  1=计 loss，0=忽略（chat 模式下只在 assistant 段 = 1）
+    itemic_id_mask  (1, T)  1=该 token 是 Itemic Token（id 落在 itemic_id_range 里），用于监控
     cu_seqlens      (S+1,)  packing 边界，供 FlashAttention 使用
     sample_idx      (1, T)  每个 token 属于打包块中的第几条样本
     epoch_idx       (1,)    浮点，平均 epoch 索引
@@ -55,38 +80,87 @@ from onerec_llm.models.qwen3.configuration_qwen3 import Qwen3Config
 logger = logging.getLogger(__name__)
 
 def set_kwargs(self, kwargs, **_kwargs):
+    """将 kwargs 字典中的键值对设置为对象的属性。
+
+    这是一个工具函数，用于把配置参数（从 JSON 配置文件读取）直接映射为对象属性，
+    这样后续代码可以直接通过 self.xxx 访问配置项，而不需要 self.kwargs["xxx"]。
+
+    Args:
+        self: 目标对象
+        kwargs: 配置参数字典（通常来自 dataset_config JSON 文件）
+        **_kwargs: 额外的覆盖参数（优先级高于 kwargs）
+    """
     kwargs.update(_kwargs)
-    self.kwargs = edict(kwargs)
+    self.kwargs = edict(kwargs)  # EasyDict 支持属性访问，如 kwargs.max_length
     for k, v in kwargs.items():
-        setattr(self, k, v)
+        setattr(self, k, v)      # 把每个配置项设置为对象属性
 
 class Qwen3ChatCompletionDataset(IterableDataset):
+    """Qwen3 训练数据集的核心处理逻辑。
+
+    本类实现了两种数据格式的处理：
+    1. segments 格式：预训练阶段使用，直接拼接文本（视频序列、物品理解、用户画像、通用文本）
+    2. messages 格式：SFT 阶段使用，处理多轮对话数据
+
+    关键功能：
+    - tokenize：将文本转换为 token ID 序列
+    - loss_mask：标记哪些 token 需要计算 loss（chat 模式只在 assistant 段）
+    - itemic_id_mask：标记 SID token（用于监控，不参与训练）
+    - sample packing：将多个短样本拼接成一条长序列，提高训练效率
+
+    继承自 PyTorch 的 IterableDataset，支持流式数据加载和多 worker 并行。
+    """
+
     def __init__(self, **kwargs):
+        """初始化数据集。
+
+        Args:
+            **kwargs: 配置参数，主要包括：
+                - base_model_dir: Qwen3 模型路径（用于加载 tokenizer 和 config）
+                - sources: 数据文件列表（JSON 文件路径或 parquet 文件列表）
+                - max_length: 每个 batch 的最大序列长度（用于 sample packing）
+                - itemic_id_range: SID token 的 ID 范围，如 [151669, 176246]
+                - add_think_pattern: 是否添加  标签（用于推理任务）
+                - cut_to_pad: 是否在 packing 时截断样本以填满 max_length
+        """
+        # 将配置参数设置为对象属性
         set_kwargs(self, kwargs)
         print_rank_0(f"ChatCompletionDataset init with kwargs={kwargs}")
 
+        # 加载模型配置（获取 pad_token_id 等信息）
         try:
             model_config = AutoConfig.from_pretrained(self.kwargs.base_model_dir)
         except Exception:
             model_config = Qwen3Config.from_pretrained(self.kwargs.base_model_dir)
 
         self.pad_token_id = model_config.pad_token_id
+
+        # 构建数据源（加载文件列表，初始化 WebDataset 或 NaiveParquetDataset）
         self.dataset, self.total_samples = self._build_source_dataset(self.sources)
 
-        # for data_source monitor
+        # 数据源监控：统计每个 source 的样本数和错误数
         self.source_sample_cnt = {}
         self.source_error_cnt = {}
+
+        # 加载 tokenizer（用于将文本转换为 token ID）
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_dir, trust_remote_code=True)
+
+        # max_sample_length: 单个样本的最大长度（不能超过 max_length）
         self.max_sample_length = min(self.max_length, self.kwargs.get("max_sample_length", 9999999))
         assert self.max_length > 0
 
-        # Chat template tokens
+        # ========== Chat 模板相关的特殊 token ==========
+        # Qwen3 的 chat 模板使用这些 token 标记对话的边界：
+        #   <|im_start|>user\n用户输入<|im_end|>\n
+        #   <|im_start|>assistant\n模型回复<|im_end|>\n
         self.im_start_token = "<|im_start|>"
         self.im_end_token = "<|im_end|>"
         self.im_start_token_id = self.tokenizer.encode(self.im_start_token)[0]
         self.im_end_token_id = self.tokenizer.encode(self.im_end_token)[0]
 
-        # Derive chat template patterns from tokenizer instead of hardcoded token ids.
+        # 预计算 chat 模板的 pattern（用于定位 assistant 段，生成 loss_mask）
+        # assistant_start_pattern: tokenize("<|im_start|>assistant\n") 的 token ID 序列
+        # im_end_pattern: tokenize("<|im_end|>\n") 的 token ID 序列
         self.assistant_start_pattern = self.tokenizer.encode(
             f"{self.im_start_token}assistant\n",
             add_special_tokens=False,
@@ -95,16 +169,20 @@ class Qwen3ChatCompletionDataset(IterableDataset):
             f"{self.im_end_token}\n",
             add_special_tokens=False,
         )
+        # 兜底：如果 <|im_end|>\n 无法 tokenize，退化为只用 <|im_end|>
         if not self.im_end_pattern:
             self.im_end_pattern = self.tokenizer.encode(
                 self.im_end_token,
                 add_special_tokens=False,
             )
 
+        # 是否添加  标签（用于推理任务的 thinking pattern）
         self.add_think_pattern = self.kwargs.get("add_think_pattern", False)
         if self.add_think_pattern:
             logger.info(f"Thinking pattern enabled: add_think_pattern={self.add_think_pattern}")
 
+        # SID token 的 ID 范围（用于生成 itemic_id_mask，监控 SID token 的 loss）
+        # 例如：itemic_id_range = [151669, 176246] 表示 SID token 的 ID 在这个范围内
         self.itemic_id_range = self.kwargs.get("itemic_id_range", None)
         if self.itemic_id_range is not None:
             assert len(self.itemic_id_range) == 2, "itemic_id_range must be a list of two elements"
@@ -297,6 +375,31 @@ class Qwen3ChatCompletionDataset(IterableDataset):
             
         Returns:
             Dictionary containing input_ids, attention_mask, labels, etc.
+
+        segments 是一个列表，通常只有1个元素
+
+        # 视频推荐数据（video_rec.py:55-59）
+        segments = [{"type": "text", "text": "<|sid_begin|><s_a_340>...<|sid_end|><|sid_begin|><s_a_120>..."}]
+        # ↑ 只有1个segment，text里包含了所有历史SID和目标SID的拼接
+
+        # 物品理解数据（item_understand.py:40-45）
+        segments = [{"type": "text", "text": "视频<|sid_begin|><s_a_340><s_b_6566><s_c_5603><|sid_end|> 展示了以下内容：搞笑猫咪视频..."}]
+        # ↑ 只有1个segment
+
+        # 用户画像数据（user_profile.py:25-30）
+        segments = [{"type": "text", "text": "用户U1的兴趣画像：喜欢观看<|sid_begin|><s_a_42>...类型的视频..."}]
+        # ↑ 只有1个segment
+
+        为什么只有1个 segment？
+
+        因为 OneRec 的预训练数据设计就是"一条样本 = 一个完整的文本序列"。
+
+        segments 是一个列表，设计初衷是为了支持多段文本拼接（例如 [{"type": "text", "text": "段落1"}, {"type": "text", "text": "段落2"}]），但在 OneRec 的实际使用中：
+
+        - 每个 segment 就是一个文本段落
+        - segments 列表通常只有1个元素（因为一条训练样本就是一条完整的序列）
+        - 循环 for segment in segments 只是为了兼容多段的情况
+
         """
         segments = sample["json"]["segments"]
 
@@ -313,9 +416,13 @@ class Qwen3ChatCompletionDataset(IterableDataset):
         # References: 
         # 1. https://huggingface.co/Qwen/Qwen3-8B/blob/main/tokenizer_config.json#L232
         # 2. https://qwen.readthedocs.io/zh-cn/latest/getting_started/concepts.html#control-tokens
+        # 添加EOS token
+        # 在每条 segments 样本末尾手动追加一个“结束标记 token”（这里项目选择用 pad_token 充当末尾特殊符号）。
         segments_text += self.tokenizer.pad_token
         
-        # Tokenize
+        # Tokenize：文本转换为 token ID 序列
+        # 每个SID标记都会被tokenizer转换为一个独立的token，因为这些标记在词表扩展阶段就被注册为独立token了
+        #
         inputs = self.tokenizer(
             segments_text,
             return_tensors="pt",
@@ -354,6 +461,13 @@ class Qwen3ChatCompletionDataset(IterableDataset):
         Returns:
             Dictionary containing input_ids, attention_mask, labels, etc.
         """
+
+        # messages格式：
+        # messages = [
+        #         {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+        #         {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+        #         {"role": "assistant", "content": [{"type": "text", "text": answer}]}
+        #     ]
         msg_key = "message" if "message" in sample["json"] else "messages"
         messages = sample["json"][msg_key]
 
@@ -405,7 +519,7 @@ class Qwen3ChatCompletionDataset(IterableDataset):
     def _process(self, sample, source_name=None):
         if "segments" in sample["json"] and sample["json"]["segments"] is not None:
             inputs = self._process_completion(sample)
-        else:
+        else:  # SFT 任务脚本里并没有产出 segments，走这个分支
             inputs = self._process_chat(sample)
 
         inputs['epoch_idx'] = sample['epoch_idx']
@@ -528,6 +642,12 @@ class Qwen3ChatCompletionDataset(IterableDataset):
         return inputs
 
     def __iter__(self):
+        """
+        从底层 parquet 迭代器拿原始 sample（Qwen3NaiveParquetDataset）
+        _process(...)：分 segments 或 messages 路径做 tokenize/loss_mask
+        做 sample packing（_packing）
+        yield packed_inputs（就是训练脚本拿到的 batch）
+        """
         if self.dataset is None:
             self.dataset, self.total_samples = self._build_source_dataset(self.sources)
 
@@ -537,6 +657,8 @@ class Qwen3ChatCompletionDataset(IterableDataset):
         ds_iter = iter(self.dataset)
         while True:
             try:
+                # sample 是一个字典，由 Qwen3NaiveParquetDataset._parser() 方法构造
+                # 每个 sample 对应 parquet 文件中的一行数据（即一个训练样本）。
                 sample = next(ds_iter)
                 sample_key = sample["__key__"] if "__key__" in sample else ""
                 sample_url = sample["__url__"] if "__url__" in sample else ""
@@ -564,10 +686,12 @@ class Qwen3ChatCompletionDataset(IterableDataset):
                 continue
 
             sample_length = inputs["input_ids"].shape[-1]
+            # # 如果当前buffer + 新样本超过max_length，执行packing
             if cur_length + sample_length >= self.max_length:
                 if self.cut_to_pad:
                     buffer.append(inputs)
                     source_list.append(source_name)
+                    # packed的样本之间间隔了EOS token
                     packed_inputs = self._packing(buffer)
 
                     packed_inputs["data_source"] = source_list
@@ -589,12 +713,13 @@ class Qwen3ChatCompletionDataset(IterableDataset):
                     logger.warning("Skipping sample with no valid loss tokens.")
                     continue
 
+                # 每次调用dataloader，生成一条packing后的长样本（B = 1），形状为(1, T)
                 yield packed_inputs
 
             else:
                 buffer.append(inputs)
                 source_list.append(source_name)
-                cur_length += sample_length
+                cur_length += sample_length  # packing序列中每条样本的实际长度
 
 class Qwen3NaiveParquetDataset(IterableDataset):
     """Naive parquet dataset for Qwen3 that handles file reading and parsing."""

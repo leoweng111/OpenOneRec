@@ -40,7 +40,7 @@ def main():
     # -------- 1) 加载模型 --------
     # 兼容两种 checkpoint：整个 ResKmeans 对象 / 只有 state_dict（train 脚本保存的形式）
     print(f"Loading model from {args.model_path}")
-    checkpoint = torch.load(args.model_path, map_location='cpu')
+    checkpoint = torch.load(args.model_path, map_location='cpu')  # 这个读取进来的就是train_res_kmeans.py训练得到的ResKmeans对象
 
     if isinstance(checkpoint, ResKmeans):
         model = checkpoint
@@ -53,8 +53,9 @@ def main():
             state_dict = checkpoint
 
         # 从 state_dict 的 key 反推超参：centroids.0, centroids.1, ...
+        # 对应模型的self.centroids属性
         n_layers = sum(1 for k in state_dict.keys() if k.startswith('centroids.'))
-        first_centroid = state_dict['centroids.0']       # (codebook_size, dim)
+        first_centroid = state_dict['centroids.0']       # 第0层的聚类中心，形状是(codebook_size, dim)，表示有codebook_size个聚类中心，每个都是dim维度的向量
         codebook_size, dim = first_centroid.shape
 
         model = ResKmeans(n_layers=n_layers, codebook_size=codebook_size, dim=dim)

@@ -7,6 +7,7 @@ class ResKmeans(nn.Module):
 
     作用：把每个 item 的连续 embedding（形状 (dim,)，一般是 Qwen3-Embedding-8B 的 4096 维输出）
     编码成一串离散 code：`(c_0, c_1, ..., c_{n_layers-1})`，每个 c_l ∈ [0, codebook_size)。
+    这里codebook_size就是每个codebook中的码向量个数。
     这串 code 就是 OneRec 中的 "Itemic Token"（视频/商品/广告等 item 的语义 ID），会被拼接进
     LLM 的 vocabulary，从而让 LLM 用生成 token 的方式来表征 & 生成 item。
 
@@ -66,14 +67,18 @@ class ResKmeans(nn.Module):
         out = torch.zeros_like(x)         # (N, dim)：累积重建结果，仅用于打印 loss
         for l in range(self.n_layers):
             kmeans.train(x)                          # faiss 内部迭代 niter 次
-            _, I = kmeans.index.search(x, 1)         # I: (N, 1)  最近质心索引
+            _, I = kmeans.index.search(x, 1)         # I: (N, 1)  最近质心索引。对于N个item，每个item都有一个最近质心的索引，所以总共有N个。
             I = I.reshape([-1])                      # (N,)
+            # kmeans.centroids 形状是 (codebook_size, dim)，代表了codebook_size个质心。
             o = torch.tensor(kmeans.centroids[I])    # (N, dim)  本层选中的质心向量
             out += o                                 # 累计 → 越来越接近 inputs
             if verbose:
-                losses = self.calc_loss(inputs, out)
+                losses = self.calc_loss(inputs, out)  # RQ-VAE训练的时候其实完全不需要做反向传播梯度下降，losses仅供打印查看
                 print(l, losses)
             x = x - o                                # (N, dim)  更新残差 → 下一层输入
+            # self.centroids[l]保存的是每层的聚类中心，总共有codebook_size个。
+            # 注意：在RQ-Kmeans中，每层的centroids是固定的，不参与反向传播，所以requires_grad=False。
+            # 另外，每层的聚类中心，就是每层的码向量，每层的聚类中心个数=码向量个数
             self.centroids[l] = nn.Parameter(
                 torch.tensor(kmeans.centroids.copy()), requires_grad=False
             )  # (codebook_size, dim)
@@ -86,7 +91,7 @@ class ResKmeans(nn.Module):
             x:        输入向量，形状 (B, dim)，B 为 batch 大小。
             n_layers: 使用前 n_layers 层做编码；None 表示用全部层。
         Returns:
-            out: 形状 (B, n_layers)，dtype int64，每列取值 ∈ [0, codebook_size)。
+            out: 形状 (B, n_layers)，dtype int64，每列取值 ∈ [0, codebook_size)。代表每层与该层残差距离最近质心的索引。
         算法：与 train_kmeans 中"最近质心 + 残差"完全一致，但是用矩阵运算做距离计算，避免依赖 faiss。
             distances[i, k] = ||x_i - centroids[k]||^2
                             = ||x_i||^2 + ||centroids[k]||^2 - 2 · x_i · centroids[k]
@@ -100,10 +105,10 @@ class ResKmeans(nn.Module):
             # x: (B, dim)；centroids[l]: (K, dim)，K=codebook_size
             x_norm_sq = x.pow(2.).sum(dim=1, keepdim=True)                      # (B, 1)
             codebook_t_norm_sq = self.centroids[l].T.pow(2.).sum(dim=0, keepdim=True)  # (1, K)
-            # distances = x_norm_sq + codebook_norm_sq - 2 * x @ centroids^T → (B, K)
+            # distances = x_norm_sq + codebook_norm_sq - 2 * x @ centroids^T → (B, K)，表示B个样本，每个样本距离K个质心的距离
             distances = torch.addmm(x_norm_sq + codebook_t_norm_sq,
                                     x, self.centroids[l].T, alpha=-2.0)
-            code = distances.argmin(dim=-1)          # (B,)  本层选中的 code
+            code = distances.argmin(dim=-1)          # (B,)  本层选中的 code，即对于每个样本而言，距离其最近的聚类中心（质心）的索引
             x = x - self.centroids[l][code]          # (B, dim)  更新残差
             out.append(code)
         out = torch.stack(out, dim=1)                # (B, n_layers)

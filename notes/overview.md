@@ -627,7 +627,7 @@ OpenOneRec/
 cd tokenizer
 
 # (1) 训练残差 K-Means（faiss GPU，1 卡即可，~1 小时 for 百万级 item）
-python train_res_kmeans.py \
+python tokenizer/train_res_kmeans.py \
     --data_path ../raw_data/item_embeddings/ \
     --model_path ../output/tokenizer_ckpt \
     --n_layers 3 \
@@ -637,7 +637,7 @@ python train_res_kmeans.py \
     --seed 42
 
 # (2) 用训好的 codebook 把每个 pid 编码成 3 元组 SID
-python infer_res_kmeans.py \
+python tokenizer/infer_res_kmeans.py \
     --model_path ../output/tokenizer_ckpt/model.pt \
     --emb_path ../raw_data/item_embeddings/all.parquet \
     --output_path ../raw_data/onerec_data/video_ad_pid2sid.parquet \
