@@ -1,0 +1,19 @@
+notes/gr_survey_summary.md
+  s_86418c5a553d08::t_bdfbbdf4fd748e 1-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.33-trip",
+  "base_commit_sha": "4b189ee3370ebb86290d35526febf0fec5c2a14a",
+  "prompts": {},
+  "sessions": {
+    "s_86418c5a553d08": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2377792-9d0c-4fa1-9bcf-5092b411bfc2",
+        "model": "qwen3.7-max"
+      },
+      "human_author": "leoweng111 <1404813015@qq.com>"
+    }
+  }
+}
