@@ -1,0 +1,22 @@
+notes/gr_survey_summary.md
+  s_86418c5a553d08::t_e28ac232f05773 68,70-79
+  s_86418c5a553d08::t_8aaaed1cd422b2 375-376
+  s_86418c5a553d08::t_1611a06fc92d63 344
+  s_86418c5a553d08::t_0d951a81efbd2c 418-423
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.33-trip",
+  "base_commit_sha": "cf34c346d26dc74fb304dda561e7c5fc6a120974",
+  "prompts": {},
+  "sessions": {
+    "s_86418c5a553d08": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2377792-9d0c-4fa1-9bcf-5092b411bfc2",
+        "model": "qwen3.7-max"
+      },
+      "human_author": "leoweng111 <1404813015@qq.com>"
+    }
+  }
+}
