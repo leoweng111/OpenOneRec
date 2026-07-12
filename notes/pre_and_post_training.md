@@ -40,7 +40,7 @@
   - [5.1 OneRec V1 — Iterative DPO偏好对齐](#51-onerec-v1--iterative-dpo偏好对齐)
   - [5.2 OneRec V2 — GBPO+时长感知Reward](#52-onerec-v2--gbpo时长感知reward)
   - [5.3 OneSearch — PARS自适应奖励](#53-onesearch--pars自适应奖励)
-  - [5.4 OneRec-Think — Rollout-Beam RL](#54-onerec-think--rollout-beam-rl)
+  - [5.4 OneRec-Think — GRPO + Rollout-Beam Reward](#54-onerec-think--grpo--rollout-beam-reward)
   - [5.5 PLUM — 加权SFT（无显式RL）](#55-plum--加权sft无显式rl)
   - [5.6 HSTU — 纯NTP无后训练对齐](#56-hstu--纯ntp无后训练对齐)
   - [5.7 LLM4DLRMs后训练（QARM V2等）](#57-llm4dlrms后训练qarm-v2等)
@@ -139,7 +139,7 @@
 | **Pretrain S2** (协同) | 推荐能力叠加 | NTP CE (全序列/target) | segments      | OneRec, PLUM |
 | **SFT** (指令) | 指令跟随+格式 | NTP CE (仅assistant) | messages      | OneRec, PLUM |
 | **DPO** (off-policy) | 偏好对齐 | DPO loss (偏好对 log-ratio) | 偏好对           | OneRec V1, OneSearch |
-| **GRPO** (on-policy) | 偏好对齐 | PPO-clip + 组内标准化 | rollout+reward | OneRec V2 |
+| **GRPO** (on-policy) | 偏好对齐 | PPO-clip + 组内标准化 | rollout+reward | OneRec V2, OneRec-Think |
 | **GBPO** (on-policy) | 偏好对齐 | 动态bound替代clip | rollout+reward | OneRec V2 |
 
 ### 1.4 预训练 vs 后训练的本质区别
@@ -228,7 +228,7 @@ HSTU (Meta) 的验证:
   首次观察到推荐领域的power-law scaling
 
 PLUM (Google) 的路线:
-  直接复用预训练Decoder-Only LLM (Gemma/PaLM)
+  直接复用预训练Decoder-Only LLM (Gemini家族)
   扩展词表 + CPT → SFT → 部署YouTube Shorts
 ```
 
@@ -295,20 +295,34 @@ $$\min_{\mathbf{R}, \{C_m\}} \sum_{i=1}^{N} \left\| \mathbf{R}\mathbf{z}_i - \su
 混合通用文本后:
   → LLM同时学习推荐模式和通用语言
   → 保持"通才+专才"的dual capability
-  → PLUM的CPT数据: 50%行为序列 + 50%物品元数据 + 通用文本
+  → PLUM的CPT数据: 行为序列+物品元数据(两者50/50) + 通用文本(比例未明确)
 ```
 
 #### 2.3.2 PLUM的CPT(Continued Pre-training)数据策略（Google YouTube部署经验）
 
 ```
-PLUM CPT数据构成:
-  ├── 用户行为序列 (watch history + engagement features)  ← 50%
-  ├── 物品元数据 (SID + title + description + ASR + channel) ← 50%
-  └── 通用文本 (保持语言能力)
+PLUM CPT数据构成（基于论文原文）:
+
+  领域数据（50% + 50% 混合）:
+  ├── 用户行为序列 (~50%)
+  │   格式: <sid_1> <channel_name> <watch_ratio> <watch_time> <hours_since_final_watch> <sid_2> ...
+  │   ← 包含SID序列 + 频道名 + 观看比例/时长/时间间隔等行为特征
+  │
+  └── 物品元数据 (~50%)
+      ├── SID + title:  "Video <sid> has title (en): <video_title>"
+      ├── SID + topics: "The topics in video <sid> are: <topics>"
+      ├── SID + ASR captions / description / channel name
+      └── 合成生成数据 (synthetically generated data)
   
+  通用文本: 论文提到CPT混合了"general-domain text data"以对齐SID模态与LLM已有知识，
+           防止灾难性遗忘，但具体比例未在论文中明确给出。
+
   训练量: ~260 billion tokens, batch_size=16, 1M steps
+  基座LLM: Gemini家族 (Decoder-Only)
   效果: 每天~9亿样本即可训练（远少于传统LEM数十亿）
 ```
+
+**注意**：通用文本确实被包含在CPT混合数据中（用于保持LLM的通用语言能力），但其具体比例论文未明确给出。
 
 #### 2.3.3 OneRec的混合数据策略（快手开源经验）
 
@@ -395,14 +409,19 @@ Stage 3: SFT (Post-training的桥梁)
 #### 2.5.2 PLUM的三阶段策略
 
 ```
-Stage 1: SID-v2 Item Tokenization
-  ├── 多模态内容 → 融合表示 → 层次量化 → SID tokens
-  ├── 独立于LLM预训练
+Stage 1: SID-v2 Item Tokenization (离线工序)
+  ├── 多模态内容 → 独立Encoder编码 → 拼接投影 → RQ-VAE量化 → SID tokens
+  ├── 融合title/description/ASR/channel等多源信息
+  ├── 多分辨率码本: K_l = 2048/2^(l-1), 渐进掩码, 共现对比损失
+  └── 独立于LLM的离线工序 — 码本训练完成后冻结
 
-Stage 2: Continued Pre-Training (CPT)
-  ├── 预训练LLM (Gemma/PaLM) → 扩展词表(加入SID tokens)
-  ├── 混合数据CPT: 50%行为 + 50%元数据 + 通用文本
+Stage 2: Continued Pre-Training (CPT) ← 关键阶段
+  ├── 预训练LLM (Gemini家族) → 扩展词表(加入SID tokens)
+  ├── 混合数据: 用户行为(~50%) + 物品元数据(~50%) + 通用文本
+  │   (50/50比例是行为与元数据之间; 通用文本确实包含但比例未明确)
   ├── ~260B tokens, 1M steps, batch_size=16
+  ├── 目标: 让SID token在LLM语言空间中获得语义锚定
+  └── 关键: CPT后模型仍保留in-context few-shot能力
 
 Stage 3: Task-Specific Fine-tuning (SFT)
   ├── Reward-weighted采样训练
@@ -526,21 +545,28 @@ $$\mathcal{L}_{\mathrm{NIO}} = \frac{1}{B \cdot L_{\mathrm{target}}} \sum_{b=1}^
 ### 3.4 PLUM (Google, 2025) — LLM复用Decoder-Only
 
 - **论文**：[PLUM: Adapting Pre-trained Language Models for Industrial-scale Generative Recommendations](https://arxiv.org/abs/2510.07784)
-- **架构**：Decoder-Only (复用Gemma/PaLM)
+- **架构**：Decoder-Only (复用Gemini家族LLM)
 
 **预训练方法论**：
 
 ```
 PLUM三阶段预训练:
   
-  Stage 1: SID-v2 Item Tokenization
-    ├── 多模态内容 → 融合表示 → 层次量化 → SID
+  Stage 1: SID-v2 Item Tokenization (离线工序)
+    ├── 多模态内容 → 各模态独立Encoder → 拼接投影 → 统一特征z
     ├── 融合title/description/ASR/channel等多源信息
-    └── 这是独立于LLM的离线工序
+    ├── RQ-VAE量化, 多分辨率码本 K_l = 2048/2^(l-1)
+    ├── 渐进掩码(Progressive Masking)强化层次语义
+    ├── 共现对比损失(注入协同过滤信号)
+    └── 独立于LLM的离线工序, 码本训练完成后冻结
   
   Stage 2: Continued Pre-Training (CPT) ← 关键阶段
-    ├── 预训练LLM → 扩展词表(加入SID tokens)
-    ├── 混合数据: 50%用户行为 + 50%物品元数据 + 通用文本
+    ├── 预训练LLM (Gemini家族) → 扩展词表(加入SID tokens)
+    ├── 混合数据:
+    │   ├── 用户行为序列 (~50%): SID序列+频道名+观看特征
+    │   ├── 物品元数据 (~50%): SID+title, SID+topics, SID+ASR/desc/channel
+    │   └── 通用文本: 包含在CPT中, 用于对齐SID模态与LLM已有知识
+    │       (论文原文确认包含通用文本, 但具体比例未明确给出)
     ├── 训练量: ~260B tokens, 1M steps, batch_size=16
     ├── 目标: 让SID token在LLM语言空间中获得语义锚定
     └── 关键: CPT后模型仍保留in-context few-shot能力
@@ -552,8 +578,8 @@ PLUM三阶段预训练:
 ```
 
 **关键创新**：
-- **SID-v2**：融合多模态内容的改进版语义ID
-- **CPT混合数据**：领域数据+通用文本混合预训练，弥合domain gap
+- **SID-v2**：融合多模态内容的改进版语义ID（多分辨率码本 + 渐进掩码 + 共现对比损失注入协同信号）
+- **CPT混合数据**：领域数据（用户行为+物品元数据）+通用文本混合预训练，弥合domain gap
 - **高样本效率**：900M MoE模型，每天仅需数亿样本训练（远少于传统LEM数十亿）
 
 **部署**：YouTube Shorts, Panel CTR +4.96%。
@@ -668,7 +694,7 @@ OneRec-Think预训练:
     ├── Noisy Sequence Learning: 从原始行为数据生成rationale
     │   → 优化rationale token prediction + target item generation
   
-  Stage 3: Reasoning Enhancement (RL, 见§5.4)
+  Stage 3: Reasoning Enhancement (GRPO, 见§5.4)
 ```
 
 **部署**：Kuaishou平台，APP Stay Time +0.159%。
@@ -861,6 +887,30 @@ OneRec V1的DPO偏好数据构造:
   5. 组成偏好对 → DPO训练
 ```
 
+**关于Reward模型与DPO的关系**（基于OneRec V1论文原文）：
+
+OneRec V1确实使用了Reward模型，但**Reward模型仅用于构造偏好对数据，不出现在DPO的loss函数中**。具体关系如下：
+
+```
+Reward模型的角色: 数据构造工具 (data construction tool)
+  ├── 离线预训练Reward模型: 四任务头 (观看时长/观看概率/关注概率/点赞概率)
+  ├── 对128条beam search候选打分 → 选出preferred和rejected
+  └── 偏好对构造完成后, Reward模型不再参与DPO训练
+
+DPO loss的角色: 策略优化 (policy optimization)
+  ├── 输入: 偏好对 (y_w, y_l) + 参考模型 M_ref (上一轮迭代快照)
+  ├── Loss: L_DPO = -log σ(β·log[M_new(y_w)/M_ref(y_w)] - β·log[M_new(y_l)/M_ref(y_l)])
+  ├── Loss中只有策略模型和参考模型的log概率比, 无reward项
+  └── 这符合DPO原始论文(Rafailov et al., 2023)的设计
+
+为什么需要Reward模型? (推荐 vs LLM的关键差异)
+  ├── LLM场景: 人工标注员可直接判断preferred vs rejected → 不需要Reward模型
+  ├── 推荐场景: 无法让用户同时评价多组推荐结果 → 偏好对不存在
+  └── Reward模型充当"代理标注员": 模拟用户判断, 从128条候选中识别最好/最差
+```
+
+**总结**：OneRec V1的DPO本质仍是DPO（loss中无显式reward），Reward模型只是解决推荐场景偏好数据缺乏的工程手段。这与GRPO等方法在loss中显式使用reward值有本质区别。
+
 #### 4.4.3 DPO vs PPO的对比
 
 | 维度 | DPO                                    | PPO/GRPO |
@@ -968,15 +1018,19 @@ Reward模型是后训练的核心组件，它将用户多维反馈量化为标�
 
 ```
 OneRec V1 Reward模型:
-  ├── 输入: target-aware item representations
+  ├── 输入: target-aware item representations (e_i = v_i ⊙ u, 元素级乘积)
   ├── 自attention捕获session内item间依赖
-  ├── 四个任务头:
-  │   • session观看时长 (watch time)
-  │   • 观看概率 (view probability)
-  │   • 关注概率 (follow probability)
-  │   • 点赞概率 (like probability)
+  ├── 四个任务头 (多任务塔):
+  │   • session观看时长 (swt)
+  │   • 观看概率 (vtr)
+  │   • 关注概率 (wtr)
+  │   • 点赞概率 (ltr)
+  ├── 训练: BCE loss, 每个任务独立预测
   ├── 多任务联合训练 → 综合reward分数
-  └── 用于: DPO偏好对构造 (128条候选 → 选preferred/rejected)
+  └── 用于: 仅用于DPO偏好对构造 (128条候选 → 选preferred/rejected)
+       └── 注意: Reward模型不出现在DPO loss中
+           它是"代理标注员", 解决推荐场景缺乏自然偏好对的问题
+           偏好对构造完成后, DPO loss仅使用策略模型的log概率比
 ```
 
 #### 4.6.2 OneRec V2的时长感知Reward
@@ -1123,6 +1177,12 @@ OneRec V1后训练 (Iterative Preference Alignment + DPO):
      → 偏好数据随策略改善而更新
 ```
 
+**关于DPO与Reward模型的关系澄清**（基于论文原文）：
+- OneRec V1使用了Reward模型，但**Reward模型仅用于构造偏好对**（即上述步骤1-2），不出现在DPO loss函数中
+- DPO loss = `-log σ(β·log[M_new(y_w)/M_ref(y_w)] - β·log[M_new(y_l)/M_ref(y_l)])`，只包含策略模型和参考模型的log概率比
+- Reward模型充当"代理标注员"：因为推荐场景无法像LLM场景那样由人类标注偏好对，所以用Reward模型模拟用户判断来从128条候选中选出最好和最差的
+- 这与GRPO等方法在loss中显式使用reward值有本质区别
+
 **核心创新**：
 - 解决推荐场景缺乏自然偏好对的问题（通过Reward模型+Beam Search构造）
 - Constrained DPO（1%混合策略）在效果和成本之间取得最优平衡
@@ -1185,21 +1245,32 @@ OneSearch后训练 (PARS + List-wise DPO):
      → 结合NTP loss混合训练
 ```
 
-### 5.4 OneRec-Think — Rollout-Beam RL
+### 5.4 OneRec-Think — GRPO + Rollout-Beam Reward
 
-- **论文**：[OneRec-Think](https://arxiv.org/abs/2510.11639)
+- **论文**：[OneRec-Think](https://arxiv.org/abs/2510.11639) (ACL 2026)
+- **强化学习方法**：**GRPO** (Group Relative Policy Optimization, DeepSeek 2024)
 
 **后训练方法论**：
 
 ```
-OneRec-Think后训练 (Rollout-Beam RL):
+OneRec-Think后训练 (GRPO + Rollout-Beam Reward):
 
   Stage 3: Reasoning Enhancement (RL)
   
+  RL算法: GRPO (论文原文: "we optimize the model using GRPO based on ℛ_Rollout-Beam")
+  ├── 使用VERL分布式RL基础设施
+  ├── 超参数: 16条采样CoT路径, beam宽度K=32, 2个训练epoch
+  ├── 学习率: 1e-5, KL系数β=0.001, clip ratio ε=0.2
+  └── 目标: 同时优化推理连贯性和推荐准确性
+
   1. Rollout-Beam Reward Mechanism ← 核心创新
-     → 在constrained beam search内评估
-     → 解决传统verification reward的稀疏性
-     → Beam内多候选同时评估 → 更丰富的偏好信号
+     → 问题: 传统verification reward (pass/fail二值) 极度稀疏
+       → 大部分推理rollout未命中目标item → 全部得到0 reward → 无法学习
+     → 解决: 在constrained beam search (K=32) 内评估
+     → 公式: ℛ_Rollout-Beam = max_{ŝ∈ℬ} Σ_{l=1}^L 𝕀(ŝ^l = s^l)
+       → 对beam内最优候选计算SID token级匹配数 → 连续值reward
+     → 利用了推荐中"多有效性" (multi-validity): 多个item可能都是合理推荐
+     → 提供比二值pass/fail更密集的学习信号
   
   2. Think-Ahead推理架构 (部署)
      → Stage1(离线): 生成T条推理路径 + beam search生成prefix (前2个SID token)
@@ -1269,13 +1340,13 @@ QARM V2的后训练:
 | 论文 | 架构 | 预训练 | SFT | 后训练对齐 | 部署效果 |
 |------|------|--------|-----|------------|----------|
 | **TIGER** | Enc-Dec(T5) | NTP CE (全序列) | 无 | 无 | 离线验证 |
-| **OneRec V1** | Enc-Dec+MoE | NTP CE (session-wise) | NTP CE | Iterative DPO | 观看时长+1.6% |
+| **OneRec V1** | Enc-Dec+MoE | NTP CE (session-wise) | NTP CE | Iterative DPO (RM仅构造偏好对) | 观看时长+1.6% |
 | **OneRec V2** | Decoder-Only | NTP CE (NIO) | NTP CE | GBPO + Duration Reward | Stay Time+0.5~0.7% |
-| **PLUM** | Decoder-Only(Gemma) | CPT+NTP | Reward-weighted SFT | 无显式RL | CTR+4.96% |
+| **PLUM** | Decoder-Only(Gemini) | CPT+NTP (行为+元数据+通用文本) | Reward-weighted SFT | 无显式RL | CTR+4.96% |
 | **HSTU** | Decoder-Only(HSTU) | NTP (Generative) | 未公开 | 未公开 | A/B+12.4% |
 | **RPG** | Decoder-Only+MTP | MTP CE | 无 | 无 | NDCG+12.6% |
 | **OneSearch** | Enc-Dec | 3-stage SFT | SFT | PARS+List-wise DPO | 电商搜索 |
-| **OneRec-Think** | Decoder-Only | Multi-task CPT | Reasoning SFT | Rollout-Beam RL | Stay Time+0.16% |
+| **OneRec-Think** | Decoder-Only | Multi-task CPT | Reasoning SFT | **GRPO** + Rollout-Beam Reward | Stay Time+0.16% |
 | **QARM** | DLRM | SID+DLRM训练 | 无 | 无 | 广告收入+9.7% |
 
 ### 6.2 演进趋势

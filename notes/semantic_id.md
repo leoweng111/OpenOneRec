@@ -34,7 +34,7 @@
   - [7.1 DAS：快手双对齐语义ID](#71-das快手双对齐语义id)
 - [8. 稀疏+稠密级联方法](#8-稀疏稠密级联方法)
   - [8.1 COBRA：百度级联表示](#81-cobra百度级联表示)
-- [9. 端到端语义ID生成](#9-端到端语义id生成)
+- [9. 端到端语义ID生成与LLM适配](#9-端到端语义id生成与llm适配)
   - [9.1 UniSID：广告推荐端到端生成](#91-unisid广告推荐端到端生成)
   - [9.2 PLUM：LLM适配生成式推荐](#92-plumllm适配生成式推荐)
 - [10. 工业基准](#10-工业基准)
@@ -293,7 +293,7 @@ LLM Encoder → dense_emb ∈ R^d → 量化器(RQ-VAE/RQ-KMeans) → 语义ID (
 | [OneRec V2](#34-onerec快手统一生成式推荐) (快手, 2025) | [arXiv:2508.20900](https://arxiv.org/abs/2508.20900) | RQ-KMeans | 串行 | Lazy Decoder-Only, 80亿参数 |
 | [RPG](#52-rpgmeta并行语义id生成) (Meta, KDD 2025) | [arXiv:2506.05781](https://arxiv.org/abs/2506.05781) | OPQ | 并行 | 一步并行生成全部语义ID |
 | [OneSearch](#62-onesearch快手电商搜索) (快手, 2025) | [arXiv:2509.03236](https://arxiv.org/abs/2509.03236) | RQ-OPQ | 混合 | RQ串行+OPQ并行，电商搜索 |
-| [PLUM](#92-plumllm适配生成式推荐) (Google, 2025) | [arXiv:2510.07784](https://arxiv.org/abs/2510.07784) | SID-v2 | 串行 | 预训练LLM适配生成式推荐 |
+| [PLUM](#92-plumllm适配生成式推荐) (Google, 2025) | [arXiv:2510.07784](https://arxiv.org/abs/2510.07784) | SID-v2 (RQ-VAE+对比损失) | 串行 | 预训练LLM适配生成式推荐，SID离线构造 |
 | [UniSID](#91-unisid广告推荐端到端生成) (2026) | [arXiv:2602.10445](https://arxiv.org/abs/2602.10445) | 端到端 | 串行 | 端到端联合优化embedding和SID |
 | [DIGER](#23-diger可微分语义id) (SIGIR 2026) | [arXiv:2601.19711](https://arxiv.org/abs/2601.19711) | 可微分RQ | 串行 | Gumbel-Softmax可微分量化 |
 | [COBRA](#81-cobra百度级联表示) (百度, 2025) | [arXiv:2503.02453](https://arxiv.org/abs/2503.02453) | 级联 | 级联 | 稀疏语义ID+稠密向量级联 |
@@ -709,6 +709,7 @@ def balanced_residual_kmeans(embeddings, L, K, balance_weight=α):
 **OneRec-Think**（arXiv:2510.11639, ACL 2026）：
 - 统一对话、文本推理和个性化推荐
 - 引入Think-Ahead架构
+- 后训练使用 **GRPO** + Rollout-Beam Reward（详见pre_and_post_training.md §5.4）
 - App Stay Time +0.159%
 
 ---
@@ -1155,9 +1156,11 @@ $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i
 
 ---
 
-## 9. 端到端语义ID生成
+## 9. 端到端语义ID生成与LLM适配
 
-**核心问题**：传统两阶段方法（先量化生成语义ID，再训练推荐模型）存在**目标不一致**问题。
+**核心问题**：传统两阶段方法（先量化生成语义ID，再训练推荐模型）存在**目标不一致**问题。本节包含两类方法：
+- **端到端语义ID生成**（UniSID）：SID构造与推荐模型联合优化
+- **LLM适配生成式推荐**（PLUM）：离线SID构造 + 预训练LLM适配（SID生成本身是离线的，但整体框架将SID纳入LLM词表进行端到端预训练）
 
 ### 9.1 UniSID：广告推荐端到端生成
 
@@ -1179,12 +1182,121 @@ $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i
 - **标题**：[PLUM: Adapting Pre-trained Language Models for Industrial-scale Generative Recommendations](https://arxiv.org/abs/2510.07784)
 - **发表**：arXiv 2025年10月
 - **使用范式**：**LLM4GRs**
-- **构造范式**：**串行**（复用现有语义ID方法）
+- **构造范式**：**串行**（SID-v2，离线RQ-VAE量化）
+
+> **注意**：PLUM的SID-v2是独立于LLM的离线工序（先量化得到SID，再扩展LLM词表进行CPT），**不属于端到端语义ID生成**。此处归类仅因其LLM适配的整体框架涉及SID构造。
 
 **核心流程**：
-1. 物品Tokenization：使用语义ID（SID-v2）将物品离散化
+1. 物品Tokenization：使用SID-v2将物品离散化（离线）
 2. 持续预训练（CPT）：扩展LLM词汇表以包含SID token
-3. 任务微调：针对生成式检索任务微调
+3. 任务微调：Reward-weighted SFT
+
+#### 9.2.1 SID-v2：增强型语义ID
+
+SID-v2是PLUM对传统语义ID（SID-v1）的改进版，核心创新在于**多分辨率码本**和**渐进掩码**机制。
+
+**多模态融合**：
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                   SID-v2 多模态融合                        │
+│                                                           │
+│  物品 i 的 M 个模态 embedding: {x_m}_{m=1}^M              │
+│                                                           │
+│  x₁ (title emb)    → Encoder ℰ₁ → z₁ ∈ R^d             │
+│  x₂ (desc emb)     → Encoder ℰ₂ → z₂ ∈ R^d             │
+│  x₃ (ASR emb)      → Encoder ℰ₃ → z₃ ∈ R^d             │
+│  x₄ (channel emb)  → Encoder ℰ₄ → z₄ ∈ R^d             │
+│  ...                                                      │
+│           ↓ concat + project                              │
+│  z = Proj([z₁; z₂; ...; z_M]) ∈ R^d  ← 统一特征向量     │
+│           ↓                                               │
+│  RQ-VAE 残差量化 → SID = (c₁, c₂, ..., c_L)             │
+└───────────────────────────────────────────────────────────┘
+```
+
+每个模态有独立的 Encoder $\mathcal{E}_m$，编码后拼接并投影为统一特征向量 $\mathbf{z}$。
+
+**创新1：多分辨率码本（Multi-Resolution Codebooks）**
+
+传统RQ-VAE使用统一的码本大小（每层K相同），SID-v2改为**逐层递减的码本分辨率**：
+
+$$K_l = \frac{2048}{2^{l-1}}$$
+
+即第1层码本大小2048，第2层1024，第3层512，以此类推。
+
+```
+传统 RQ-VAE (SID-v1):
+  Level 1: K=2048  → c₁ ∈ {0,...,2047}
+  Level 2: K=2048  → c₂ ∈ {0,...,2047}
+  Level 3: K=2048  → c₃ ∈ {0,...,2047}
+
+SID-v2 (Multi-Resolution):
+  Level 1: K=2048  → c₁ ∈ {0,...,2047}  ← 高分辨率，最大区分度
+  Level 2: K=1024  → c₂ ∈ {0,...,1023}  ← 中分辨率，编码中等残差
+  Level 3: K=512   → c₃ ∈ {0,...,511}   ← 低分辨率，编码低熵残差
+```
+
+**设计动机**：第1层负责最粗粒度的语义区分（需要大码本），后续层编码的是逐层递减的残差（熵更低，小码本即可）。这与信息论中的逐层细化编码思想一致。
+
+**创新2：渐进掩码（Progressive Masking）**
+
+在RQ-VAE训练过程中，引入随机掩码机制以强化层次结构的语义一致性：
+
+$$m_l = \mathbb{1}_{l < r}, \quad r \sim \text{Uniform}(1, L)$$
+
+量化向量变为：$\hat{\mathbf{z}} = \sum_{l=1}^{L} m_l \cdot \mathbf{e}_{c_l}^{(l)}$
+
+```
+训练时随机选择截断层 r:
+  r=1: ẑ = e₁*           (只用第1层码字)
+  r=2: ẑ = e₁* + e₂*     (用前2层码字)
+  r=3: ẑ = e₁* + e₂* + e₃* (用全部3层码字)
+  
+效果: 迫使每层独立编码有意义的语义，而非依赖后续层补偿
+     → 更严格的层次语义层次结构
+```
+
+**训练损失（三部分）**：
+
+$$\mathcal{L}_{\text{SID-v2}} = \mathcal{L}_{\text{recon}} + \mathcal{L}_{\text{RQ}} + \mathcal{L}_{\text{con}}$$
+
+- **重构损失**：$\mathcal{L}_{\text{recon}} = \sum_{m=1}^{M} \| \mathbf{x}_m - \hat{\mathbf{x}}_m \|^2$（多模态重构）
+- **RQ损失**：$\mathcal{L}_{\text{RQ}} = \sum_{l=1}^{L} \left[ \beta \| \mathbf{r}_l - \text{sg}(\mathbf{e}_{c_l}^{(l)}) \|^2 + \| \text{sg}(\mathbf{r}_l) - \mathbf{e}_{c_l}^{(l)} \|^2 \right]$（码本+承诺损失）
+- **共现对比损失**（Co-occurrence Contrastive Loss）：
+
+$$\mathcal{L}_{\text{con}} = -\sum_{i=1}^{2N_b} \log \frac{\exp(\text{sim}(\mathbf{p}_i, \mathbf{p}_{i^+}))}{\sum_{j=1}^{2N_b} \exp(\text{sim}(\mathbf{p}_i, \mathbf{p}_j))}$$
+
+其中 $i^+$ 是与 $i$ 在用户行为序列中共现的物品。该损失鼓励频繁共现的物品获得相似的SID表示，不共现的物品被推远。这是SID-v2相对于SID-v1的重要改进——**将协同过滤信号注入语义ID**。
+
+**SID-v2 vs SID-v1 总结**：
+
+| 维度 | SID-v1 | SID-v2 |
+|------|--------|--------|
+| 码本分辨率 | 统一（每层K相同） | 多分辨率（$K_l = 2048/2^{l-1}$） |
+| 层次约束 | 无显式约束 | 渐进掩码（Progressive Masking） |
+| 协同信号 | 无 | 共现对比损失注入 |
+| 多模态融合 | 简单拼接 | 独立Encoder + 拼接投影 |
+
+#### 9.2.2 PLUM 的LLM适配流程
+
+```
+PLUM 整体流程:
+
+  Stage 1: SID-v2 Item Tokenization (离线)
+    ├── 多模态内容 → Encoder融合 → RQ-VAE量化 → SID tokens
+    ├── 融合title/description/ASR/channel等多源信息
+    └── 独立于LLM的离线工序（码本固定后不再更新）
+  
+  Stage 2: Continued Pre-Training (CPT)
+    ├── 预训练LLM (Gemini家族) → 扩展词表(加入SID tokens)
+    ├── 混合数据CPT (详见pre_and_post_training.md §3.4)
+    └── 目标: SID token在LLM语言空间中获得语义锚定
+  
+  Stage 3: Task-Specific SFT
+    ├── Reward-weighted采样训练
+    └── Beam search推理, hallucination率 < 5%
+```
 
 **YouTube Shorts实验**：Panel CTR +4.96%。
 
@@ -1383,7 +1495,8 @@ $$\mathcal{L}_{\text{MMQ}} = \mathcal{L}_{\text{quant}} + \lambda_1 \mathcal{L}_
 | **RQ-OPQ** | OneSearch | GRs | 混合 | 层次+效率 |
 | **双对齐** | DAS | DLRMs/GRs | 兼容多种 | 注入协同信号 |
 | **级联** | COBRA | GRs | 级联 | 稀疏+稠密互补 |
-| **端到端** | UniSID, PLUM | GRs | 串行 | 目标一致 |
+| **端到端** | UniSID | GRs | 串行 | 目标一致 |
+| **LLM适配** | PLUM | GRs | 串行 | 预训练LLM复用+SID-v2离线量化 |
 
 #### 按解决的问题分类
 
@@ -1397,9 +1510,10 @@ $$\mathcal{L}_{\text{MMQ}} = \mathcal{L}_{\text{quant}} + \lambda_1 \mathcal{L}_
 | 码本冲突 | FSQ混合量化 | QARM V2 |
 | 存储效率 | 无参数SID转换 | SIDE |
 | 信息损失 | 稀疏+稠密级联 | COBRA |
-| 缺乏协同信号 | 双对齐/CF注入 | DAS |
+| 缺乏协同信号 | 双对齐/CF注入/共现对比损失 | DAS, PLUM (SID-v2) |
 | 码本不均衡 | 多级别衡量化 | OneRec |
 | **语义-行为gap** | **行为感知微调** | **MMQ, DAS** |
+| LLM适配 | 离线SID+预训练LLM词表扩展+CPT | PLUM |
 
 ### 12.2 未来方向
 
