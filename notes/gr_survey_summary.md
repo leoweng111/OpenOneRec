@@ -65,9 +65,18 @@
 
 **LLM4GRs（LLM赋能的生成式推荐）**：将推荐重构为序列生成任务，利用Transformer的自回归生成能力直接生成目标物品的语义ID。代表工作包括TIGER、OneRec、PLUM、RPG等。
 
-**LLM4DLRMs（LLM赋能的深度推荐模型）**：保持传统判别式推荐架构，将语义ID作为输入特征替换随机Item ID。代表工作包括QARM、YouTube Semantic IDs、SIDE、DAS等。
+**LLM4DLRMs（LLM赋能的深度推荐模型）**：保持判别式推荐的任务定义（对候选item打分排序），但在模型架构或特征表示上借鉴LLM的技术。这一范式内部又可分为两个发展阶段：
 
-两者的核心区别在于：LLM4GRs中语义ID是**生成目标**，LLM4DLRMs中语义ID是**输入特征**。
+- **阶段一：语义ID作为输入特征**——在传统DLRM架构中用语义ID替换随机Item ID，模型主体仍为DNN/DLRM。代表工作包括QARM、YouTube Semantic IDs、SIDE、DAS等。
+- **阶段二：Transformer/Decoder-like架构用于判别式排序**——直接采用Transformer（特别是Decoder-like）架构作为排序模型，但输出仍为CTR/CVR预测分数而非生成的物品ID序列。这一方向的代表工作包括：
+  - **RankMixer**（字节跳动, arXiv:2507.15551, 2025.7）：用Token Mixing替代标准self-attention，配合per-token FFN和Sparse MoE，扩展至10亿参数规模，部署于抖音Feed排序
+  - **HyFormer**（字节跳动, arXiv:2601.12681, 2026.1）：用Query Decoding（类decoder cross-attention）统一长序列建模与特征交互，全球Token跨attend行为序列的KV表示，部署于抖音
+  - **LONGER**（字节跳动, RecSys 2025）：面向长序列的GPU高效Transformer，处理万级用户行为序列
+  - **TokenMixer-Large**（字节跳动, 2026.2）：RankMixer的进化版，在线7B/离线15B参数，验证了判别式推荐模型的scaling law
+  - **HiFormer**（Google, 2023）：异构交互Transformer，用于Google Play应用排序
+  - **LiGR**（LinkedIn, 2025）：改造Transformer做set-wise排序打分，验证排序模型的scaling law
+
+两者的核心区别在于：LLM4GRs中语义ID是**生成目标**（输出为token序列），LLM4DLRMs中语义ID是**输入特征**（输出为标量分数）。但值得注意的是，LLM4DLRMs阶段二的模型已经在**架构层面**与LLM4GRs趋同（都使用Transformer/Decoder-like架构），区别仅在于最终任务是**生成**（自回归next-token prediction）还是**判别**（CTR/CVR打分）。GPSD（KDD 2025）进一步验证了两条路线可以衔接：先用生成式预训练（NTP）初始化模型，再迁移到判别式微调，判别式模型同样遵循power-law scaling。
 
 ### 1.3 完整训练管线
 
@@ -119,9 +128,9 @@ DLRM范式下，样本组织也在经历平行变革：
 
 - **Pointwise**（传统）：每个(user, item)对独立成样本，模型独立打分
 - **Request-wise / List-wise**（当前主流）：同一次请求中的多个item打包为一条样本，共享user特征（如网易云音乐Climber）
-- **Set-wise**（新兴）：将粗排给精排的大量候选item（如300个）打包为一条样本，支持跨item交互（如美团HoMer）
+- **Set-wise**（美团HoMer）：将粗排给精排的大量候选item（如300个）打包为一条样本，支持跨item交互（如美团HoMer）
 
-LLM4GRs和LLM4DLRMs的样本组织方式可以正交组合：存储层选Request-wise压缩，训练层选NIO避免泄漏，是工业最优实践。
+LLM4GRs和LLM4DLRMs的样本组织方式可以正交组合：存储层选Request-wise压缩，训练层选NIO避免泄漏。
 
 ### 2.3 反馈信号选择
 
@@ -130,7 +139,8 @@ LLM4GRs和LLM4DLRMs的样本组织方式可以正交组合：存储层选Request
 - **弱反馈正向行为**（如曝光/有效播放）：数据量大但兴趣信号噪，需要强化学习"洗"出真偏好。OneRec即预测"Next Impression Item"。
 - **强反馈正向行为**（如点赞/收藏/完播）：信号纯但量少，且可能存在时序乱序问题。
 
-两者不是互斥的——弱反馈做预训练学共现规律，强反馈做SFT/RL学偏好对齐，这也是多阶段训练隐含的策略。
+两者不是互斥的——弱反馈做预训练学共现规律，强反馈做SFT/RL学偏好对齐，这也是多阶段训练隐含的策略。当然，可以只用强信号构造行为序列（比如Meta的HSTU），
+或者做多阶段训练（比如快手OneRec）
 
 ---
 
@@ -331,6 +341,7 @@ Reward模型将用户多维反馈量化为标量信号，是后训练的核心�
 | Encoder-Decoder | TIGER, OneRec V1, OneSearch | 上下文编码能力强 |
 | Decoder-Only | OneRec V2, PLUM, HSTU, RPG | 算力效率高，遵循scaling law |
 | LLM复用 | PLUM (Gemini) | 复用预训练知识，开发效率高 |
+| **Transformer判别式** | RankMixer, HyFormer, HiFormer | 借用LLM架构做CTR打分，scaling law验证 |
 
 **按训练管线分类**：
 
@@ -360,6 +371,8 @@ Reward模型将用户多维反馈量化为标量信号，是后训练的核心�
 6. **推理增强**：OneRec-Think引入Think-before-Recommend，生成推理链再做推荐决策，类似LLM的Chain-of-Thought
 
 7. **多目标对齐**：单维reward→多维reward（时长、点赞、关注、评论等），Reward Shaping/Adaptive Weighting
+
+8. **生成式与判别式架构趋同**：LLM4GRs和LLM4DLRMs在架构层面逐步趋同——两者都在使用Transformer/Decoder-like架构，区别仅在最终任务是生成（NTP）还是判别（CTR打分）。GPSD验证了生成式预训练可以初始化判别式模型，暗示两条路线可能最终收敛
 
 ### 6.3 未来方向
 
@@ -402,3 +415,9 @@ Reward模型将用户多维反馈量化为标量信号，是后训练的核心�
 19. DPO — Rafailov et al. (2023). Direct Preference Optimization. *NeurIPS 2023*. arXiv:2305.18284
 20. GRPO — DeepSeek Team. (2025). DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.
 21. HoMer — Meituan. (2025). Addressing Heterogeneities by Modeling Sequential and Set-wise Contexts. arXiv:2510.11100
+22. RankMixer — Zhu et al., ByteDance. (2025). RankMixer: Scaling Up Ranking Models in Industrial Recommenders. arXiv:2507.15551
+23. HyFormer — Huang et al., ByteDance. (2026). HyFormer: Revisiting the Roles of Sequence Modeling and Feature Interaction in CTR Prediction. arXiv:2601.12681
+24. LONGER — ByteDance. (2025). Scaling Up Long Sequence Modeling in Industrial Recommenders. *RecSys 2025*.
+25. HiFormer — Google. (2023). Heterogeneous Interaction Transformer for App Ranking. arXiv:2311.xxxxx
+26. LiGR — LinkedIn. (2025). From Features to Transformers: Redefining Ranking for Scalable Impact. arXiv:2502.xxxxx
+27. GPSD — (2025). Generative Pretraining for Scalable Discriminative Recommendation. *KDD 2025*.
