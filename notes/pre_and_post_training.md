@@ -74,7 +74,7 @@
 
 这和LLM的发展历程完全一致：GPT系列经历了 **Pretrain → SFT → RLHF/DPO** 三阶段才变成ChatGPT。生成式推荐走的是同一条路。
 
-### 1.2 训练管线全景图
+### 1.2 训练管线全景图（以快手OneRec V2为例）
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -132,13 +132,13 @@
 
 ### 1.3 各阶段的核心目标与损失函数
 
-| 阶段 | 核心目标 | 主损失函数 | 数据格式 | 代表论文 |
-|------|----------|------------|----------|----------|
-| **SID构造** (离线) | 物品→离散token | 量化损失 (RQ-VAE/PQ/FSQ) | 物品多模态特征 | TIGER, QARM |
-| **Pretrain S1** (对齐) | SID token语义锚定 | NTP CE (全序列) | segments | OneRec, PLUM |
-| **Pretrain S2** (协同) | 推荐能力叠加 | NTP CE (全序列/target) | segments | OneRec, PLUM |
-| **SFT** (指令) | 指令跟随+格式 | NTP CE (仅assistant) | messages | OneRec, PLUM |
-| **DPO** (off-policy) | 偏好对齐 | DPO loss (偏好对 log-ratio) | 偏好对 | OneRec V1, OneSearch |
+| 阶段 | 核心目标 | 主损失函数 | 数据格式          | 代表论文 |
+|------|----------|------------|---------------|----------|
+| **SID构造** (离线) | 物品→离散token | 量化损失 (RQ-VAE/PQ/FSQ) | 物品（文本或多模态）特征  | TIGER, QARM |
+| **Pretrain S1** (对齐) | SID token语义锚定 | NTP CE (全序列) | segments      | OneRec, PLUM |
+| **Pretrain S2** (协同) | 推荐能力叠加 | NTP CE (全序列/target) | segments      | OneRec, PLUM |
+| **SFT** (指令) | 指令跟随+格式 | NTP CE (仅assistant) | messages      | OneRec, PLUM |
+| **DPO** (off-policy) | 偏好对齐 | DPO loss (偏好对 log-ratio) | 偏好对           | OneRec V1, OneSearch |
 | **GRPO** (on-policy) | 偏好对齐 | PPO-clip + 组内标准化 | rollout+reward | OneRec V2 |
 | **GBPO** (on-policy) | 偏好对齐 | 动态bound替代clip | rollout+reward | OneRec V2 |
 
@@ -265,7 +265,8 @@ $$\min_{\mathbf{R}, \{C_m\}} \sum_{i=1}^{N} \left\| \mathbf{R}\mathbf{z}_i - \su
 
 #### 2.2.3 SID构造与预训练的关系
 
-SID构造是**独立于预训练的离线工序**。量化码本（codebook）不参与LLM预训练——LLM训练的是SID token的embedding，而非码本本身。两者的embedding空间完全独立（参见notes/onerec_questions.md §3的详细分析）。
+一般是做双阶段训练的。SID构造是**独立于预训练的离线工序**。量化码本（codebook）不参与LLM预训练——LLM训练的是SID token的embedding，而非码本本身。两者的embedding空间完全独立，因此SID一般不直接
+参与后续的预训练，需要先做对齐。（参见notes/onerec_questions.md §3的详细分析）。
 
 但DIGER提出了一种新思路：**端到端可微分SID**，通过Gumbel-Softmax让推荐梯度直接回传到量化层，联合优化SID构造和推荐目标。
 
@@ -273,7 +274,7 @@ SID构造是**独立于预训练的离线工序**。量化码本（codebook）�
 
 #### 2.3.1 数据类型
 
-预训练需要三类核心数据 + 通用文本：
+对于推荐大模型，预训练不仅仅是让LLM学会next item prediction，还要让LLM学会**SID token的语义理解**等等内容。因此，一般需要多种数据类型来满足不同的预训练目标。以快手OneRec为例，预训练数据分为四类：
 
 | 数据类型 | 作用 | 格式 | 代表 |
 |----------|------|------|------|
@@ -297,7 +298,7 @@ SID构造是**独立于预训练的离线工序**。量化码本（codebook）�
   → PLUM的CPT数据: 50%行为序列 + 50%物品元数据 + 通用文本
 ```
 
-#### 2.3.2 PLUM的CPT数据策略（Google YouTube部署经验）
+#### 2.3.2 PLUM的CPT(Continued Pre-training)数据策略（Google YouTube部署经验）
 
 ```
 PLUM CPT数据构成:
@@ -334,16 +335,16 @@ $$\mathcal{L}_{\mathrm{NTP}} = -\frac{1}{|\mathcal{S}|}\sum_{k \in \mathcal{S}} 
 
 **$\mathcal{S}$ 的选择取决于样本组织方式**：
 
-| 组织方式 | $\mathcal{S}$（算loss的位置） | loss_mask |
-|----------|----------------------------|-----------|
-| Naive Impression | 全序列所有token | 全1(除EOS) |
-| User-Centric | 用户序列所有token | 全1(除EOS) |
-| New Impression Only | 仅target item的token | 仅target段=1 |
-| SFT (messages) | 仅assistant段 | assistant段=1 |
+| 组织方式 | $\mathcal{S}$（算loss的位置）     | loss_mask |
+|----------|-----------------------------|-----------|
+| Naive Impression | 全序列所有token                  | 全1(除EOS) |
+| User-Centric | 用户序列所有token                 | 全1(除EOS) |
+| New Impression Only | 仅target item的token          | 仅target段=1 |
+| SFT (messages) | 仅assistant段，可参考OpenOneRec做法 | assistant段=1 |
 
 #### 2.4.2 Multi-Token Prediction (MTP) — RPG的并行损失
 
-RPG不使用逐token自回归，而是所有SID token并行预测：
+Meta的RPG不使用逐token自回归，而是所有SID token并行预测：
 
 $$\mathcal{L}_{\mathrm{MTP}} = \sum_{m=1}^{M} \mathcal{L}_{\mathrm{CE}}(c_m, \hat{c}_m)$$
 
@@ -359,7 +360,7 @@ $$\mathcal{L}_{\mathrm{InfoNCE}} = -\log \frac{\exp(\mathrm{sim}(z_i, z_j^+)/\ta
 
 $$\mathcal{L}_{\mathrm{align}} = \mathcal{L}_{\mathrm{u2i}} + \mathcal{L}_{\mathrm{i2i}} + \mathcal{L}_{\mathrm{co}}$$
 
-**PLUM的SID训练损失**（三组分）：
+**PLUM的SID训练损失**（三部分）：
 
 $$\mathcal{L}_{\mathrm{SID}} = \mathcal{L}_{\mathrm{recon}} + \mathcal{L}_{\mathrm{RQ}} + \mathcal{L}_{\mathrm{contrastive}}$$
 
@@ -430,7 +431,7 @@ Stage 3: Task-Specific Fine-tuning (SFT)
 
 ### 2.6 预训练样本组织方式
 
-样本组织方式决定了loss_mask的标记策略和训练效率。详见 `notes/sample_schema.md`，此处简述：
+样本组织方式决定了loss_mask的标记策略和训练效率。详见 `样本组织方式`文档，此处简述：
 
 | 组织方式 | 样本粒度 | loss范围 | 代表 | 适用场景 |
 |----------|----------|----------|------|----------|
@@ -758,7 +759,14 @@ LLM4DLRMs（判别式推荐+语义ID）的预训练不涉及LLM自回归训练�
 ### 4.3 SFT（监督微调）—— 后训练的桥梁
 
 SFT是预训练到偏好对齐之间的桥梁阶段。它不属于偏好对齐，但为偏好对齐提供了必要的基础。
+SFT 只教模型“像训练集一样说话”（极大似然估计 Cross-Entropy），缺乏统筹全局商业目标（点击率、停留时长）和探索未知空间（优中选优）的能力。
 
+后训练（RLHF/RL）的精髓：
+  1. 引入全局奖励：打破自回归生成中 token 局部的限制，直接为生成的整个序列（或长列表）赋予业务Reward。
+  2. 避免幻觉（Hallucination）：生成式推荐最大的问题是生成库里没有的ID或者用户极度反感的商品，RL可以通过负向惩罚严格控制。
+  3. 从隐式反馈（Logs）到对齐：使用 DPO/GBPO 这样的算法，直接基于离线点击/未点击日志，跳过复杂的奖励模型（Reward Model）训练，实现端到端的偏好对齐。
+
+以OneRecV2为例，SFT阶段的训练目标是**让模型学会按指令回答**，而不是单纯续写SID序列：
 #### 4.3.1 SFT做什么
 
 ```
@@ -815,7 +823,7 @@ $$\mathcal{L}_{\mathrm{SFT}} = -\sum r(u, v_c) \cdot \log P(\mathrm{sid}_t \mid 
 - 效果接近简单RL，但训练更稳定
 
 ### 4.4 DPO（直接偏好优化）—— off-policy对齐
-
+详细的强化学习后训练笔记：https://trip.larkenterprise.com/docx/CLHpdWvVKo4QRIxHb2HcLkCVnUc
 #### 4.4.1 DPO原理
 
 DPO (Direct Preference Optimization) 由Rafailov等人于2023年提出，核心思想是**绕过显式reward模型，直接从偏好对优化策略**。
@@ -855,15 +863,15 @@ OneRec V1的DPO偏好数据构造:
 
 #### 4.4.3 DPO vs PPO的对比
 
-| 维度 | DPO | PPO/GRPO |
-|------|-----|----------|
-| **采样方式** | off-policy (预训练模型生成) | on-policy (当前策略生成) |
-| **是否需要Reward模型** | 需要(构造偏好对), loss中不显式用 | 需要(评分), loss中显式用 |
-| **是否需要Critic** | 不需要 | PPO需要, GRPO不需要 |
-| **模型数量** | 2个(策略+参考) | PPO:4个, GRPO:2个 |
-| **训练稳定性** | 较好(分类loss) | 可能不稳定(策略梯度) |
-| **偏好信号粒度** | 二值(preferred/rejected) | 连续(reward值) |
-| **迭代能力** | 可迭代DPO (多轮off-policy) | 天然支持迭代on-policy |
+| 维度 | DPO                                    | PPO/GRPO |
+|------|----------------------------------------|----------|
+| **采样方式** | off-policy (预训练模型生成)                   | on-policy (当前策略生成) |
+| **是否需要Reward模型** | 构造偏好对需要（如果已有明确业务含义的偏好对则不需要）, loss中不显式用 | 需要(评分), loss中显式用 |
+| **是否需要Critic** | 不需要                                    | PPO需要, GRPO不需要 |
+| **模型数量** | 2个(策略+参考)                              | PPO:4个, GRPO:2个 |
+| **训练稳定性** | 较好(分类loss)                             | 可能不稳定(策略梯度) |
+| **偏好信号粒度** | 二值(preferred/rejected)                 | 连续(reward值) |
+| **迭代能力** | 可迭代DPO (多轮off-policy)                  | 天然支持迭代on-policy |
 
 ### 4.5 PPO/GRPO/GBPO —— on-policy策略梯度
 
@@ -895,7 +903,7 @@ $$A_i = \frac{r_i - \operatorname{mean}(r_1,\dots,r_G)}{\operatorname{std}(r_1,\
 - 组内标准化自然处理了reward尺度问题
 - 特别适合推理型模型（DeepSeek-R1的验证）
 
-**OneRec开源的GRPO实现**（`verl_rl/recipe/onerec/`）：
+**快手OpenOneRec开源的GRPO实现**（`verl_rl/recipe/onerec/`）：
 
 ```
 GRPO rollout流程:
@@ -929,6 +937,7 @@ OneRec V2提出了GBPO，对GRPO/PPO做了两项关键改进：
 
 **GBPO的核心理念**：PPO的clip是为了防止策略更新过大，但它同时丢弃了有用梯度。GBPO通过动态bound替代硬clip，既保持稳定性又不浪费梯度信息。
 
+GBPO、ECPO本质上都是针对PPO的改进，主要是提升了训练稳定性。
 #### 4.5.4 On-policy vs Off-policy的本质区别
 
 ```
@@ -1037,7 +1046,7 @@ OneSearch (PARS):
   3. List-wise DPO训练
 ```
 
-#### 4.7.2 GRPO rollout的构造方式
+#### 4.7.2 GRPO rollout采样的构造方式
 
 ```
 OneRec V2 / OpenOneRec:
@@ -1241,7 +1250,7 @@ HSTU后训练: 无公开的后训练对齐方法
 
 ### 5.7 LLM4DLRMs后训练（QARM V2等）
 
-LLM4DLRMs的后训练通常是**传统DLRM的微调**（BCE + 多任务loss），不涉及DPO/GRPO等偏好对齐方法。
+LLM4DLRMs的后训练（如果统一称为后训练的话）一般就是**传统DLRM的训练**（BCE + 多任务loss），不涉及DPO/GRPO等偏好对齐方法。
 
 ```
 QARM V2的后训练:
