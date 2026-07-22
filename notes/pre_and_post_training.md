@@ -132,15 +132,15 @@
 
 ### 1.3 各阶段的核心目标与损失函数
 
-| 阶段 | 核心目标 | 主损失函数 | 数据格式          | 代表论文 |
-|------|----------|------------|---------------|----------|
-| **SID构造** (离线) | 物品→离散token | 量化损失 (RQ-VAE/PQ/FSQ) | 物品（文本或多模态）特征  | TIGER, QARM |
+| 阶段 | 核心目标          | 主损失函数 | 数据格式          | 代表论文 |
+|------|---------------|------------|---------------|----------|
+| **SID构造** (离线) | 物品→离散token    | 量化损失 (RQ-VAE/PQ/FSQ) | 物品（文本或多模态）特征  | TIGER, QARM |
 | **Pretrain S1** (对齐) | SID token语义锚定 | NTP CE (全序列) | segments      | OneRec, PLUM |
-| **Pretrain S2** (协同) | 推荐能力叠加 | NTP CE (全序列/target) | segments      | OneRec, PLUM |
-| **SFT** (指令) | 指令跟随+格式 | NTP CE (仅assistant) | messages      | OneRec, PLUM |
-| **DPO** (off-policy) | 偏好对齐 | DPO loss (偏好对 log-ratio) | 偏好对           | OneRec V1, OneSearch |
-| **GRPO** (on-policy) | 偏好对齐 | PPO-clip + 组内标准化 | rollout+reward | OneRec V2, OneRec-Think |
-| **GBPO** (on-policy) | 偏好对齐 | 动态bound替代clip | rollout+reward | OneRec V2 |
+| **Pretrain S2** (协同) | 推荐能力叠加        | NTP CE (全序列/target) | segments      | OneRec, PLUM |
+| **SFT** (指令) | 指令跟随+格式（从“会续写”到“会按指令回答”）     | NTP CE (仅assistant) | messages      | OneRec, PLUM |
+| **DPO** (off-policy) | 偏好对齐          | DPO loss (偏好对 log-ratio) | 偏好对           | OneRec V1, OneSearch |
+| **GRPO** (on-policy) | 偏好对齐          | PPO-clip + 组内标准化 | rollout+reward | OneRec V2, OneRec-Think |
+| **GBPO** (on-policy) | 偏好对齐          | 动态bound替代clip | rollout+reward | OneRec V2 |
 
 ### 1.4 预训练 vs 后训练的本质区别
 
@@ -298,7 +298,7 @@ $$\min_{\mathbf{R}, \{C_m\}} \sum_{i=1}^{N} \left\| \mathbf{R}\mathbf{z}_i - \su
   → PLUM的CPT数据: 行为序列+物品元数据(两者50/50) + 通用文本(比例未明确)
 ```
 
-#### 2.3.2 PLUM的CPT(Continued Pre-training)数据策略（Google YouTube部署经验）
+#### 2.3.2 PLUM的CPT(Continued Pre-training)数据策略（Google YouTube）
 
 ```
 PLUM CPT数据构成（基于论文原文）:
@@ -324,7 +324,7 @@ PLUM CPT数据构成（基于论文原文）:
 
 **注意**：通用文本确实被包含在CPT混合数据中（用于保持LLM的通用语言能力），但其具体比例论文未明确给出。
 
-#### 2.3.3 OneRec的混合数据策略（快手开源经验）
+#### 2.3.3 OneRec的混合数据策略（快手开源OpenOneRec）
 
 ```
 OneRec Stage 1 数据构成:
@@ -699,19 +699,19 @@ OneRec-Think预训练:
 
 **部署**：Kuaishou平台，APP Stay Time +0.159%。
 
-### 3.9 LLM4DLRMs预训练（QARM, SIDE, DAS等）
+### 3.9 LLM4DLRMs的训练（QARM, SIDE, DAS等）
 
-LLM4DLRMs（判别式推荐+语义ID）的预训练不涉及LLM自回归训练，而是训练传统DLRM模型，将语义ID作为输入特征替换随机Item ID。
+LLM4DLRMs（判别式推荐+语义ID）的训练不涉及LLM自回归训练，也不被成为预训练，而是训练传统DLRM模型，将语义ID作为输入特征替换随机Item ID。
 
-| 论文 | 预训练方式 | 损失函数 | 关键点 |
-|------|------------|----------|--------|
+| 论文 | 训练方式 | 损失函数 | 关键点 |
+|------|-----------|----------|--------|
 | **QARM** (快手) | SID构造(Res-KMeans) → DLRM训练 | BCE + 多任务 | SID embedding替换随机ID |
 | **QARM V2** (快手) | LLM推理增强 → Res-KmeansFSQ → DLRM | BCE + 多任务 | 推理能力注入SID |
 | **SIDE** (Meta) | VQ-Fusion → DLRM训练 | BCE | 无参数SID→embedding转换 |
 | **DAS** (快手) | 双量化+CF去偏+对比对齐 | InfoNCE + CE | 多视角对比学习 |
 | **YouTube SIDs** | RQ-VAE → SentencePiece → 排序DNN | BCE | 十亿级排序系统 |
 
-**与LLM4GRs预训练的本质区别**：DLRMs预训练是**判别式训练**（BCE/sigmoid），不涉及NTP或自回归生成。语义ID只是输入特征，不是生成目标。
+**与LLM4GRs预训练的本质区别**：DLRMs的训练是**判别式训练**（BCE/sigmoid），不涉及NTP或自回归生成。语义ID只是输入特征，不是生成目标。
 
 ---
 
@@ -1430,7 +1430,7 @@ QARM V2的后训练:
 
 15. Jiang, J., et al. (2026). End-to-End Semantic ID Generation for Generative Advertisement Recommendation (UniSID). arXiv:2602.10445.
 
-16. MMQ Team. (2025). MMQ: Multimodal Mixture-of-Quantization Tokenization. *WSDM 2026*. arXiv:2502.16077.
+16. MMQ Team. (2025). MMQ: Multimodal Mixture-of-Quantization Tokenization. *WSDM 2026*. arXiv:2508.15281.
 
 17. DIGER Team. (2026). Differentiable Semantic ID for Generative Recommendation. *SIGIR 2026*. arXiv:2601.19711.
 

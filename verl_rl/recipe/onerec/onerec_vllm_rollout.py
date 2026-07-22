@@ -1,3 +1,31 @@
+"""
+OneRec 两阶段 Rollout 生成
+==========================
+
+本文件实现 OneRec 特有的两阶段生成策略 (Two-Stage Generation):
+
+  Stage 1 — CoT 推理采样:
+    模型以 sampling 方式生成推理链 (Chain-of-Thought)
+    输入: prompt tokens (system + user + /think)
+    停止: 遇到 </think> 或达到 max_tokens (默认1024)
+    特点: 鼓励多样性推理，温度 T=1.0
+
+  Stage 2 — 物品 Beam Search:
+    模型以 beam search 方式搜索最优物品 SID
+    输入: [prompt + CoT + </think>] + [<|sid_begin|>]
+    参数: beam_width=32 (默认), max_tokens=16
+    特点: 精确搜索最优物品组合
+
+  为什么分两阶段?
+    CoT 是自由文本 → 适合 sampling (鼓励多样性)
+    SID 是离散码   → 适合 beam search (精确搜索)
+    两种解码策略不兼容，所以分开做。
+
+  扩展机制:
+    每个 prompt 生成 beam_width=32 条候选
+    batch 从 [B] 扩展到 [B×32]
+    同一 prompt 的 32 条候选共享 UID，用于 GRPO 组内比较
+"""
 import numpy as np
 import torch
 from tensordict import TensorDict
@@ -14,18 +42,20 @@ except ImportError:
 
 
 class OneRecvLLMRollout(vLLMRollout):
-    """
-    Custom vLLM Rollout for OneRec with Two-Stage Generation:
-    1. Sample CoT until </think>
-    2. Beam search items using Prompt + CoT + Prefix
+    """OneRec 自定义 vLLM Rollout，实现两阶段生成。
+
+    继承自 vLLMRollout，重写 generate_sequences() 方法:
+      标准 vLLMRollout: 一步生成 (sampling 或 beam search)
+      OneRecvLLMRollout: 两步生成 (Stage1 sampling → Stage2 beam search)
     """
 
     @torch.no_grad()
     def _two_stage_generation(self, prompts: DataProto, **kwargs) -> DataProto:
-        """
-        Two-stage generation:
-        1. Sample CoT until </think>.
-        2. Beam search items using Prompt + CoT + Prefix.
+        """两阶段生成的核心实现。
+
+        数据流:
+          [B 条 prompt] → Stage 1 (CoT采样) → [B 条 prompt+CoT]
+                       → Stage 2 (Beam搜索) → [B×beam_width 条候选序列]
         """
         idx = prompts.batch["input_ids"]
         attention_mask = prompts.batch["attention_mask"]
@@ -55,9 +85,12 @@ class OneRecvLLMRollout(vLLMRollout):
             if isinstance(input_data["prompt_token_ids"], np.ndarray):
                 input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
 
-        # Stage 1: CoT Sampling
-        # Use standard sampling parameters but stop at </think>
-        # Read stage1_max_tokens from config (set via ++actor_rollout_ref.rollout.stage1_max_tokens)
+        # ====================================================================
+        # Stage 1: CoT 推理采样
+        # ====================================================================
+        # 用 sampling 方式生成推理链 (Chain-of-Thought)
+        # 遇到 </think> 自动停止，最多生成 stage1_max_tokens 个 token
+        # n=1: 每个 prompt 只生成 1 条 CoT (beam search 在 Stage 2 做)
         stage1_max_tokens = kwargs.get("stage1_max_tokens",
                             getattr(self.config, "stage1_max_tokens",
                             kwargs.get("max_tokens", 1024)))  # fallback to max_tokens or 1024
@@ -92,7 +125,11 @@ class OneRecvLLMRollout(vLLMRollout):
             use_tqdm=False,
         )
         
-        # Process Stage 1 Outputs and Prepare Stage 2 Inputs
+        # ====================================================================
+        # 处理 Stage 1 输出，构造 Stage 2 输入
+        # ====================================================================
+        # Stage 2 的输入 = 原始 prompt + CoT 输出 + 前缀 "\n<|sid_begin|>"
+        # 前缀告诉模型: "推理结束，现在开始推荐物品"
         stage2_inputs = []
         cot_responses = []
 
@@ -126,8 +163,12 @@ class OneRecvLLMRollout(vLLMRollout):
                 stage2_input["multi_modal_data"] = vllm_inputs[i]["multi_modal_data"]
             stage2_inputs.append(stage2_input)
 
-        # Stage 2: Item Beam Search
-        # Read from kwargs first, then fallback to config, then default
+        # ====================================================================
+        # Stage 2: 物品 Beam Search
+        # ====================================================================
+        # 在 CoT 推理完成后，用 beam search 精确搜索最优物品 SID 组合
+        # beam_width=32: 同时保留 32 条最优候选 (用于 GRPO 组内比较)
+        # max_tokens=16: 最多生成 16 个 token (足够放多个 SID 三元组)
         beam_width = kwargs.get("stage2_beam_size", getattr(self.config, "stage2_beam_size", 32))
         # Support both stage2_max_tokens and stage2_num_tokens (for backward compatibility)
         max_tokens_item = kwargs.get("stage2_max_tokens",
@@ -151,8 +192,12 @@ class OneRecvLLMRollout(vLLMRollout):
             params=beam_params,
         )
 
-        # Post-process beam search outputs (aligned with standard beam search logic)
-        # For two-stage rollout, always return all beams for both training and evaluation
+        # ====================================================================
+        # 后处理: 展开 beam search 结果
+        # ====================================================================
+        # return_all_beams=True 时，将每个 prompt 的 32 条 beam 全部返回
+        # 输出从 [B] 扩展到 [B×beam_width]
+        # 同一 prompt 的 32 条候选共享 UID → GRPO 组内标准化时互相比较
         return_all_beams = kwargs.get("return_all_beams", True)
         # For two-stage rollout, n_beams_to_return should be beam_width, not kwargs["n"] (which is rollout_n)
         n_beams_to_return = beam_width

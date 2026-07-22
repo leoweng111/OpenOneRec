@@ -1552,4 +1552,801 @@ Pretrain 解决“模型懂不懂内容与序列规律”，SFT 解决“模型�
 
 ---
 
-*最后更新: 2026-07-08*
+## 7. RL 后训练（GRPO）详细解析
+
+### 7.1 RL 在训练流程中的位置
+
+RL（强化学习）是 SFT 之后的最后一个训练阶段，目标是让模型从"会按指令回答"进化为"懂用户偏好"。
+
+```
+Stage 1: Itemic-Text Alignment（冻结LLM，仅训SID embedding）
+   ↓
+Stage 2: Full-parameter Co-Pretraining（全参数，推荐+通用文本）
+   ↓
+Stage 3: SFT（全参数，指令格式数据，assistant-only loss）
+   ↓
+Stage 4: RL / GRPO（全参数，rollout+reward+策略梯度）  ← 本章内容
+```
+
+**RL 要解决的核心问题**：SFT 只教模型"像训练集一样回答"，但推荐系统的真正目标不是"续写SID"，而是"推荐用户真正感兴趣的物品"。RL通过reward信号将"用户是否真的喜欢"反馈给模型。
+
+```
+SFT 的目标:  给定用户历史 → 生成和训练集一样的SID
+RL 的目标:   给定用户历史 → 生成用户真正会看/点赞/长看的SID
+
+SFT loss: CE loss (下一个token是否正确)
+RL loss:  策略梯度 (生成的推荐好不好)
+```
+
+### 7.2 为什么用 GRPO 而不是 PPO / DPO？
+
+OneRec V2 使用的是 **GRPO（Group Relative Policy Optimization）**，这是 DeepSeek 在 2025 年提出的方法。
+
+```
+PPO:  需要4个模型 (Actor + Critic + Reference + Reward) → 内存开销大
+GRPO: 只需2个模型 (Actor + Reference) → 去掉Critic，用组内标准化替代
+DPO:  不需要Reward模型，但需要预先构造偏好对 → off-policy，偏好数据可能过时
+
+GRPO 的优势:
+  1. 不需要Critic网络 → 内存减半
+  2. on-policy采样 → 偏好信号始终与当前策略匹配
+  3. 组内标准化 → 自然处理reward尺度问题
+  4. 天然可迭代 → 每轮rollout都是最新策略
+```
+
+### 7.3 RL 代码文件地图
+
+```
+verl_rl/recipe/onerec/
+├── run_grpo.sh                  ← 启动脚本（Hydra配置）
+├── main_onerec_ppo.py           ← 训练入口（Ray初始化 + Trainer创建）
+├── onerec_recipe.py             ← 数据加载 + Reward函数定义
+├── onerec_vllm_rollout.py       ← 两阶段Rollout（CoT采样 + Beam Search）
+├── onerec_fsdp_workers.py       ← FSDP Worker集成
+└── onerec_ray_trainer.py        ← 训练主循环（RayPPOTrainer.fit()）
+
+verl_rl/verl/trainer/ppo/
+└── core_algos.py                ← GRPO/PPO核心算法（优势估计、loss计算）
+```
+
+### 7.4 RL 数据准备
+
+#### 数据格式
+
+RL 数据与 SFT 类似，使用 `messages` 格式，但多了一个 `reward_model` 字段存放 ground truth：
+
+```python
+# onerec_recipe.py: OneRecDataset.__getitem__()
+
+row = {
+    "prompt": [
+        {"role": "system", "content": "你是一个智能推荐助手..."},
+        {"role": "user",   "content": "根据用户历史推荐下一个视频...\n/think"},
+    ],
+    "reward_model": {
+        "ground_truth": "<|sid_begin|><s_a_42><s_b_15><s_c_89><|sid_end|>",  # ← 正确SID
+        "style": "rule",
+    },
+    "data_source": "RecIF_VideoRec",  # 数据来源标识
+}
+```
+
+**与SFT的关键区别**：
+- SFT 有 `assistant` 角色 → 模型学习"模仿正确答案"
+- RL 没有 `assistant` → 模型自己生成答案，然后由reward评判好坏
+
+#### 数据加载代码
+
+```python
+# onerec_recipe.py: OneRecDataset (继承自RLHFDataset)
+
+def __getitem__(self, idx):
+    row = self.data[idx]
+    
+    # 1. 提取prompt（去掉最后一条assistant消息）
+    messages = row["messages"]
+    prompt_messages = messages[:-1]  # system + user，不含assistant
+    
+    # 2. 提取ground truth SID
+    gt = row.get("reward_model", {}).get("ground_truth", "")
+    
+    # 3. Tokenize prompt
+    prompt_ids = self.tokenizer.apply_chat_template(
+        prompt_messages, tokenize=True, add_generation_prompt=True
+    )
+    
+    return {
+        "prompt": prompt_ids,
+        "ground_truth": gt,
+        "data_source": row.get("source", "default"),
+    }
+```
+
+### 7.5 两阶段 Rollout（核心生成逻辑）
+
+Rollout 是 RL 中"让模型自己生成推荐结果"的步骤。OneRec 使用**两阶段生成**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                两阶段 Rollout 流程                            │
+│                                                             │
+│  Stage 1: CoT 推理采样                                       │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  输入: prompt tokens (system + user + /think)        │   │
+│  │  方式: temperature sampling (T=1.0, top_p=1.0)      │   │
+│  │  停止: 遇到 </think> 或达到1024 tokens               │   │
+│  │  输出: [prompt] + [推理链tokens] + [</think>]        │   │
+│  └──────────────────────────┬──────────────────────────┘   │
+│                             ↓                               │
+│  Stage 2: 物品 Beam Search                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  输入: [prompt] + [CoT] + [</think>] + [<|sid_begin|>]│   │
+│  │  方式: beam search (beam_width=32)                    │   │
+│  │  最大: 16 tokens (足够生成多个SID三元组)              │   │
+│  │  输出: 32条候选序列 (每条包含若干SID)                  │   │
+│  └──────────────────────────┬──────────────────────────┘   │
+│                             ↓                               │
+│  扩展: [B条prompt] → [B×32条候选]                            │
+│  (同一prompt的32条候选共享UID，用于GRPO组内比较)             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Stage 1 代码（CoT 采样）
+
+```python
+# onerec_vllm_rollout.py: generate_sequences()
+
+# Stage 1: CoT reasoning
+cot_sampling_params = SamplingParams(
+    n=1,                                    # 每个prompt只采1条CoT
+    temperature=kwargs.get("temperature", 1.0),
+    top_p=kwargs.get("top_p", 1.0),
+    top_k=-1,                               # 不限制
+    max_tokens=stage1_max_tokens,           # 默认1024
+    stop=["</think>"],                      # 遇到</think>停止
+    include_stop_str_in_output=True,        # 保留</think>在输出中
+)
+
+cot_outputs = self.inference_engine.generate(
+    prompts=vllm_inputs,
+    sampling_params=cot_sampling_params,
+)
+# 输出: [prompt tokens] + [CoT reasoning tokens] + [</think>]
+```
+
+#### Stage 2 代码（物品 Beam Search）
+
+```python
+# onerec_vllm_rollout.py: generate_sequences()
+
+# Stage 2: Item beam search
+# 在CoT输出后追加 <|sid_begin|> 前缀
+stage2_inputs = cot_output + tokenize("\n<|sid_begin|>")
+
+beam_params = BeamSearchParams(
+    beam_width=beam_width,                  # 默认32
+    max_tokens=max_tokens_item,             # 默认16
+)
+
+item_outputs = self.inference_engine.beam_search(
+    prompts=stage2_inputs,
+    params=beam_params,
+)
+# 输出: 32条候选序列，每条包含若干SID三元组
+```
+
+#### 为什么分两阶段？
+
+```
+如果一步到位 (prompt → CoT + SID):
+  → CoT是自由文本（需要sampling），SID是离散码（需要beam search）
+  → 两种生成策略不兼容
+  → 如果在sampling模式下生成SID，命中率极低
+
+分两阶段:
+  → Stage 1 用sampling生成CoT（鼓励多样性推理）
+  → Stage 2 用beam search生成SID（精确搜索最优物品）
+  → 各自用最适合的解码策略
+```
+
+#### Stage 1 CoT 推理采样的作用与背后逻辑
+
+**CoT 是什么？**
+
+CoT（Chain-of-Thought，推理链）是模型在给出推荐之前先生成的一段**推理文本**。类似于人类推荐东西时会先想一下"这个用户喜欢什么类型"，模型也被训练先"思考"再"推荐"。
+
+一个实际的 CoT 输出例子：
+
+```
+<think>
+用户最近观看了多个篮球相关视频（NBA集锦、投篮教学），
+且对科技评测类内容也有兴趣（手机开箱、芯片评测）。
+篮球视频的观看时长较长，说明是核心兴趣。
+科技类内容观看较浅，可能是偶尔点击。
+综合判断：应优先推荐篮球相关的高质量内容。
+</think>
+<|sid_begin|><s_a_42><s_b_15><s_c_89><|sid_end|>
+```
+
+CoT 内容是 SFT 阶段通过 `rec_reason` 等任务训练出来的。模型学会了在 `<think>` 和 `</think>` 之间输出推理过程。
+
+**为什么需要先做 CoT？三个核心原因：**
+
+**原因一：激活推理能力，提升推荐质量**
+
+```
+不做 CoT (直接生成 SID):
+  用户历史 [A, B, C] → 模型直接输出 SID
+  → 模型只做"模式匹配"：看了A, B, C之后通常看D
+
+做 CoT (先推理再推荐):
+  用户历史 [A, B, C] → 模型先分析用户兴趣 → 再输出 SID
+  → 模型做"推理决策"：A和B都是篮球内容，C是科技内容，
+     用户在篮球上花的时间更长 → 推荐篮球内容
+```
+
+这和 LLM 的 CoT 原理一样：**让模型"想清楚"再回答，比直接回答更准确**。OneRec-Think 论文验证了这一点：带 CoT 的推荐比不带 CoT 的推荐在 App Stay Time 上提升 +0.159%。
+
+**原因二：两种解码策略的最优组合**
+
+CoT 和 SID 需要完全不同的解码策略，这是分两阶段的根本技术原因：
+
+```
+CoT 生成 (Stage 1):
+  → 自由文本，词汇空间大 (176k tokens)
+  → 需要多样性 (同一用户历史，可以有不同的分析角度)
+  → 适合: temperature sampling (T=1.0, top_p=1.0)
+  → 鼓励探索不同的推理路径
+
+SID 生成 (Stage 2):
+  → 离散码，词汇空间小 (每层 8192 tokens)
+  → 需要精确性 (找到最优的物品组合)
+  → 适合: beam search (beam_width=32)
+  → 系统搜索最优 SID 组合
+
+两种策略不兼容 → 必须分两阶段
+```
+
+如果在 sampling 模式下直接生成 SID，由于词汇空间太大（176k tokens），随机采样几乎不可能命中正确的 SID 三元组。beam search 可以系统地搜索最优组合，但不适合生成自由文本（会丢失多样性）。
+
+**原因三：为 GRPO 提供丰富的比较信号**
+
+```
+同一 prompt 的不同 CoT 路径:
+
+  CoT路径1: "用户喜欢篮球 → 推荐NBA" → SID_A → reward=1 (命中)
+  CoT路径2: "用户喜欢科技 → 推荐手机" → SID_B → reward=0 (未命中)
+  CoT路径3: "用户喜欢篮球 → 推荐投篮教学" → SID_C → reward=0.5 (部分命中)
+
+  GRPO 组内比较:
+    路径1 优势 > 0 → 鼓励"分析出篮球兴趣"的推理
+    路径2 优势 < 0 → 抑制"分析出科技兴趣"的推理
+    → 模型学到: 应该推理出用户的核心兴趣再推荐
+```
+
+不同的 CoT 采样路径产生不同的推理链，每条推理链又引导 beam search 找到不同的 SID 候选。GRPO 在这些候选中做组内比较，模型不仅学到了"推荐什么好"，还学到了"怎么推理才能推荐得好"。
+
+**为什么遇到 `</think>` 就停止？**
+
+`</think>` 是 SFT 阶段训练出来的**格式边界标记**，将"思考"和"推荐"两个阶段严格分开：
+
+```
+SFT 训练数据教会模型的格式:
+  </think>
+  → 模型做"推理决策"：A和B都是篮球内容，C是科技内容，
+     用户在篮球上花的时间更长 → 推荐篮球内容
+```
+
+这和 LLM 的 CoT 原理一样：**让模型"想清楚"再回答，比直接回答更准确**。OneRec-Think 论文验证了这一点：带 CoT 的推荐比不带 CoT 的推荐在 App Stay Time 上提升 +0.159%。
+
+**原因二：两种解码策略的最优组合**
+
+CoT 和 SID 需要完全不同的解码策略，这是分两阶段的根本技术原因：
+
+```
+CoT 生成 (Stage 1):
+  → 自由文本，词汇空间大 (176k tokens)
+  → 需要多样性 (同一用户历史，可以有不同的分析角度)
+  → 适合: temperature sampling (T=1.0, top_p=1.0)
+  → 鼓励探索不同的推理路径
+
+SID 生成 (Stage 2):
+  → 离散码，词汇空间小 (每层 8192 tokens)
+  → 需要精确性 (找到最优的物品组合)
+  → 适合: beam search (beam_width=32)
+  → 系统搜索最优 SID 组合
+
+两种策略不兼容 → 必须分两阶段
+```
+
+如果在 sampling 模式下直接生成 SID，由于词汇空间太大（176k tokens），随机采样几乎不可能命中正确的 SID 三元组。beam search 可以系统地搜索最优组合，但不适合生成自由文本（会丢失多样性）。
+
+**原因三：为 GRPO 提供丰富的比较信号**
+
+```
+同一 prompt 的不同 CoT 路径:
+
+  CoT路径1: "用户喜欢篮球 → 推荐NBA" → SID_A → reward=1 (命中)
+  CoT路径2: "用户喜欢科技 → 推荐手机" → SID_B → reward=0 (未命中)
+  CoT路径3: "用户喜欢篮球 → 推荐投篮教学" → SID_C → reward=0.5 (部分命中)
+
+  GRPO 组内比较:
+    路径1 优势 > 0 → 鼓励"分析出篮球兴趣"的推理
+    路径2 优势 < 0 → 抑制"分析出科技兴趣"的推理
+    → 模型学到: 应该推理出用户的核心兴趣再推荐
+```
+
+不同的 CoT 采样路径产生不同的推理链，每条推理链又引导 beam search 找到不同的 SID 候选。GRPO 在这些候选中做组内比较，模型不仅学到了"推荐什么好"，还学到了"怎么推理才能推荐得好"。
+
+**为什么遇到 `</think>` 就停止？**
+
+`</think>` 是 SFT 阶段训练出来的**格式边界标记**，将"思考"和"推荐"两个阶段严格分开：
+
+```
+SFT 训练数据教会模型的格式:
+  </think>
+  → Stage 2 开始: beam search 精确搜索最优 SID
+```
+
+这个设计让模型在 SFT 阶段就学会了"思考完就输出推荐"的行为模式，RL 阶段通过 reward 信号进一步强化这种模式。
+
+#### 不使用 CoT 的情况 (enable_think=False)
+
+当 `enable_think=False` 时，模型会跳过推理直接推荐：
+
+```
+输入: prompt + /no_think
+输出: </think><|sid_begin|><s_a_X><s_b_Y><s_c_Z>
+
+→ CoT 内容为空
+→ Stage 1 几乎瞬间完成
+→ 直接进入 Stage 2 beam search
+→ 速度快，但推荐质量可能下降 (缺少推理过程)
+```
+
+`run_grpo.sh` 中通过 `ENABLE_THINK` 环境变量控制是否启用 CoT。
+
+### 7.6 Reward 计算（评判推荐好坏）
+
+Reward 是 RL 的核心信号——告诉模型"你刚才生成的推荐好不好"。
+
+#### Reward 函数总览
+
+```python
+# onerec_recipe.py: compute_score()
+
+def compute_score(solution_str, ground_truth, **kwargs):
+    """
+    solution_str: 模型生成的完整输出 (CoT + SID序列)
+    ground_truth: 正确的SID序列字符串
+    """
+    return {
+        "score": pass_at_1,              # 主reward: 第一个SID是否命中
+        "format_reward": format_reward,  # CoT格式是否正确
+        "partial_hit_reward": partial,   # 部分匹配奖励
+        "hit_reward": hit,               # 整体命中率
+        "pass_rate": pass_rate,          # 是否有任一SID命中
+        "pass_at_1": pass_at_1,          # 第一个SID命中率
+    }
+```
+
+#### 各 Reward 函数详解
+
+**1. `first_sid_hit_reward`（Pass@1）—— 主 reward**
+
+```python
+def first_sid_hit_reward(pred_str, gt_str):
+    """
+    判断模型生成的第一个SID是否在ground truth中
+    
+    pred_str: "...<|sid_begin|><s_a_42><s_b_15><s_c_89><|sid_end|>..."
+    gt_str:   "<|sid_begin|><s_a_42><s_b_15><s_c_89><|sid_end|>"
+    
+    返回: 1.0 (命中) 或 0.0 (未命中)
+    """
+    pred_sids = extract_sids(pred_str)   # 提取所有预测的SID
+    gt_sids = extract_sids(gt_str)       # 提取所有正确的SID
+    
+    if len(pred_sids) == 0:
+        return 0.0
+    
+    # 只看第一个预测的SID
+    first_pred = pred_sids[0]
+    return 1.0 if first_pred in gt_sids else 0.0
+```
+
+**2. `think_format_reward` —— 格式奖励**
+
+```python
+def think_format_reward(response_str):
+    """
+    检查模型是否遵循了 <think>...</think> 格式
+    返回: 1.0 (格式正确) 或 0.0 (格式错误)
+    """
+    if "</think>" in response_str:
+        return 1.0
+    return 0.0
+```
+
+**3. `hit_reward` —— 整体命中率**
+
+```python
+def hit_reward(pred_str, gt_str):
+    """
+    预测SID集合与ground truth的交集比例
+    返回: [0, 1] 连续值
+    """
+    pred_sids = set(extract_sids(pred_str))
+    gt_sids = set(extract_sids(gt_str))
+    
+    if len(pred_sids) == 0:
+        return 0.0
+    
+    intersection = pred_sids & gt_sids
+    return len(intersection) / len(pred_sids)
+```
+
+**4. `partial_hit_reward` —— 层次化部分匹配**
+
+```python
+def partial_hit_reward(pred_str, gt_str):
+    """
+    按SID三元组的匹配层次给分:
+      s_a + s_b + s_c 全部匹配: 100分
+      s_a + s_b 匹配:            10分
+      s_a 匹配:                   1分
+      不匹配:                     0分
+    
+    对所有预测SID取平均分
+    """
+    pred_sids = extract_sid_triplets(pred_str)  # [(s_a, s_b, s_c), ...]
+    gt_sids = extract_sid_triplets(gt_str)
+    
+    total_score = 0
+    for pred in pred_sids:
+        best = 0
+        for gt in gt_sids:
+            if pred[0] == gt[0] and pred[1] == gt[1] and pred[2] == gt[2]:
+                best = max(best, 100)  # 完全匹配
+            elif pred[0] == gt[0] and pred[1] == gt[1]:
+                best = max(best, 10)   # 前两层匹配
+            elif pred[0] == gt[0]:
+                best = max(best, 1)    # 仅第一层匹配
+        total_score += best
+    
+    return total_score / max(len(pred_sids), 1)
+```
+
+#### 为什么设计多种 Reward？
+
+```
+单一 pass@1 reward 的问题:
+  → 只返回0或1，信号极度稀疏
+  → 32条beam中大部分都没命中 → 全部得到0 reward
+  → 组内标准化后优势全为0 → 无法学习
+
+多层次 reward 的解决思路:
+  → partial_hit_reward 给出"部分匹配"的梯度信号
+  → 即使没有完全命中，"第一层码匹配了"也能得到1分
+  → "前两层匹配了"得到10分
+  → 组内标准化后，部分匹配的候选获得正优势 → 模型学到"方向是对的"
+```
+
+### 7.7 GRPO 优势估计（Group Relative Advantage）
+
+GRPO 的核心思想：**不需要Critic网络，用同一prompt的多条候选互相比较**。
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                  GRPO 优势估计流程                             │
+│                                                              │
+│  同一个prompt (UID=abc):                                      │
+│    候选1: reward = 100 (完全命中)                              │
+│    候选2: reward = 10  (前两层匹配)                           │
+│    候选3: reward = 0   (完全不匹配)                           │
+│    ...                                                       │
+│    候选32: reward = 1  (第一层匹配)                           │
+│                                                              │
+│  组内统计:                                                     │
+│    mean = (100 + 10 + 0 + ... + 1) / 32 ≈ 5.3               │
+│    std  = sqrt(variance) ≈ 18.7                              │
+│                                                              │
+│  标准化优势:                                                   │
+│    A₁ = (100 - 5.3) / (18.7 + ε) ≈ 5.06   ← 正优势(好)     │
+│    A₂ = (10  - 5.3) / (18.7 + ε) ≈ 0.25   ← 弱正优势      │
+│    A₃ = (0   - 5.3) / (18.7 + ε) ≈ -0.28  ← 负优势(差)     │
+│                                                              │
+│  效果: 鼓励模型多生成"候选1式"的输出，少生成"候选3式"的输出    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### CoT 与 Beam Search 候选的关系
+
+GRPO 组内比较的"一组候选"是怎么来的？取决于 `ROLLOUT_N` 参数：
+
+**当 ROLLOUT_N=1（默认）：**
+
+```
+每个 prompt (用户历史):
+  → 1 条 CoT 推理 (Stage 1, sampling, n=1)
+    → 32 条 SID 候选 (Stage 2, beam search, beam_width=32)
+      → GRPO 在这 32 条之间做组内比较
+
+即: 1 CoT : 32 SID 候选, 共享同一 UID
+```
+
+32 条候选**共享同一条 CoT**，它们的区别只在 beam search 阶段——同一个推理结论下，搜索不同的物品组合。组内比较的是"同一个推理方向下，哪个物品更好"。
+
+**当 ROLLOUT_N > 1（例如 ROLLOUT_N=2）：**
+
+```
+每个 prompt (用户历史):
+  → 2 条不同的 CoT 推理 (Stage 1, sampling, n=2)
+    → 每条 CoT 各自产生 32 条 SID 候选
+      → 总共 2 × 32 = 64 条候选
+        → GRPO 在这 64 条之间做组内比较
+
+即: 2 CoT × 32 beam = 64 候选, 共享同一 UID
+```
+
+这时组内比较的不仅是"哪个物品更好"，还包括"哪种推理路径更好"：
+
+```
+CoT路径1: "用户喜欢篮球" → beam search 32条篮球相关SID
+CoT路径2: "用户喜欢科技" → beam search 32条科技相关SID
+
+GRPO 在 64 条中比较:
+  → 篮球类的 reward 整体更高 → CoT路径1 和它的 SID 都获得正优势
+  → 科技类的 reward 整体更低 → CoT路径2 和它的 SID 都获得负优势
+  → 模型同时学到: "推理方向要对" + "推荐物品要好"
+```
+
+#### UID 机制：如何保证同一 prompt 的候选分到一组
+
+```python
+# onerec_ray_trainer.py / fit()
+
+# 1. 为每个 prompt 生成 UID (在扩展之前)
+batch.non_tensor_batch["uid"] = np.array(
+    [str(uuid.uuid4()) for _ in range(input_len)],  # input_len = prompt 数量
+    dtype=object,
+)
+
+# 2. repeat 扩展 (如果 rollout_n > 1, 每个 prompt 重复 n 次用于多次 CoT 采样)
+batch = batch.repeat(repeat_times=rollout_n, interleave=True)
+# UID 也被 repeat: [uid_1, uid_1, uid_2, uid_2, ...]
+
+# 3. beam search 扩展 (每条再扩展 beam_width 倍)
+# 扩展后: [uid_1 × 32, uid_2 × 32, ...]
+
+# GRPO: 同一 uid 的所有候选 (共 rollout_n × beam_width 条) 做组内标准化
+```
+
+**总结**：默认配置（ROLLOUT_N=1）下是 1 CoT → 32 beam 候选 → 组内比较"哪个物品更好"。增大 `ROLLOUT_N` 可以让多条不同推理路径的候选一起比较，训练信号更丰富（同时优化推理方向和推荐物品），但计算成本也线性增长。
+
+#### GRPO 代码
+
+```python
+# verl.trainer.ppo.core_algos/core_algos.py: compute_grpo_outcome_advantage()
+
+def compute_grpo_outcome_advantage(
+    token_level_rewards,    # (batch_size, seq_len) token级reward
+    response_mask,          # (batch_size, seq_len) 有效位置mask
+    index,                  # (batch_size,) UID标识
+    eps=1e-6,
+):
+    # 1. 计算每条候选的总reward (outcome reward)
+    scores = (token_level_rewards * response_mask).sum(dim=-1)  # (batch_size,)
+    
+    # 2. 按UID分组
+    id2score = defaultdict(list)
+    for i in range(batch_size):
+        id2score[index[i]].append(scores[i])
+    
+    # 3. 组内统计
+    id2mean = {}
+    id2std = {}
+    for idx in id2score:
+        id2mean[idx] = torch.mean(torch.stack(id2score[idx]))
+        id2std[idx] = torch.std(torch.stack(id2score[idx]))
+    
+    # 4. 标准化
+    advantages = torch.zeros_like(scores)
+    for i in range(batch_size):
+        uid = index[i]
+        if norm_adv_by_std:
+            advantages[i] = (scores[i] - id2mean[uid]) / (id2std[uid] + eps)
+        else:
+            advantages[i] = scores[i] - id2mean[uid]  # Dr.GRPO变体
+    
+    # 5. 扩展到token维度
+    advantages = advantages.unsqueeze(-1) * response_mask  # (batch_size, seq_len)
+    returns = advantages  # GRPO没有value function，returns = advantages
+    
+    return advantages, returns
+```
+
+#### UID 的关键作用
+
+```python
+# onerec_ray_trainer.py: fit()
+
+# 在beam search扩展之前生成UID
+batch.non_tensor_batch["uid"] = np.array(
+    [str(uuid.uuid4()) for _ in range(input_len)],  # 每个prompt一个UID
+    dtype=object,
+)
+
+# beam search扩展后，同一prompt的32条候选共享同一UID
+# → GRPO分组时，这32条候选会被分到同一组做组内标准化
+batch = batch.repeat(repeat_times=expand_factor, interleave=True)
+# UID也被repeat: [uid_1, uid_1, ...(32次)..., uid_2, uid_2, ...(32次)...]
+```
+
+### 7.8 PPO-Clip 策略梯度 Loss
+
+有了优势值后，用PPO-Clip loss更新策略模型：
+
+$$\mathcal{L}_{\text{PPO}} = -\mathbb{E}\left[\min\left(\rho_t A_t,\ \text{clip}(\rho_t, 1-\epsilon, 1+\epsilon) A_t\right)\right] + \beta \cdot \text{KL}(\pi_\theta \| \pi_{\text{ref}})$$
+
+其中 $\rho_t = \pi_\theta(\text{tok}_t | \text{ctx}) / \pi_{\text{old}}(\text{tok}_t | \text{ctx})$ 是新旧策略的概率比。
+
+```python
+# core_algos.py: compute_policy_loss()
+
+def compute_policy_loss(
+    log_prob,           # 当前策略的log概率 (batch, seq_len)
+    old_log_prob,       # rollout时旧策略的log概率
+    advantages,         # GRPO优势值 (batch, seq_len)
+    response_mask,      # 有效位置mask
+    clip_ratio=0.28,    # PPO clip范围
+    kl_coef=0.001,      # KL正则系数
+):
+    # 1. 计算概率比 ρ = exp(log π_new - log π_old)
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    
+    # 2. PPO-Clip目标
+    pg_losses1 = -advantages * ratio                          # 未clip
+    pg_losses2 = -advantages * torch.clamp(                   # clip
+        ratio, 1.0 - clip_ratio, 1.0 + clip_ratio
+    )
+    pg_losses = torch.max(pg_losses1, pg_losses2)             # 取max(保守估计)
+    
+    # 3. KL正则 (防止策略偏移太远)
+    kl_loss = kl_coef * negative_approx_kl
+    
+    # 4. 总loss = 策略loss + KL正则
+    total_loss = pg_losses + kl_loss
+    
+    # 5. 在有效位置上取平均
+    loss = (total_loss * response_mask).sum() / response_mask.sum()
+    
+    return loss
+```
+
+#### PPO-Clip 的直觉理解
+
+```
+为什么需要 clip？
+
+  假设某个候选的 advantage > 0 (好推荐):
+    ratio = π_new / π_old
+    如果 ratio 已经很大(模型已经很确信这是好推荐):
+      未clip: 梯度继续推动 ratio 更大 → 过度自信 → 训练不稳定
+      clip:   限制 ratio ≤ 1+ε → 防止过大的策略更新
+
+  假设某个候选的 advantage < 0 (差推荐):
+    ratio 很小时:
+      未clip: 梯度继续压低 ratio → 模型可能"永远不生成这类推荐"
+      clip:   限制 ratio ≥ 1-ε → 保留一定的探索能力
+
+clip_ratio_high = 0.28 (OneRec默认)
+→ ratio 被限制在 [0.72, 1.28] 范围内
+→ 每步策略更新幅度有限，训练更稳定
+```
+
+### 7.9 完整训练循环（每一步发生了什么）
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              GRPO 训练循环 (每一步)                               │
+│                                                                 │
+│  Step 1: 加载batch                                              │
+│    dataset → [B条prompt + ground_truth]                         │
+│                                                                 │
+│  Step 2: 两阶段Rollout (用当前actor模型)                         │
+│    Stage 1: CoT采样 → [prompt + CoT + </think>]                │
+│    Stage 2: Beam Search → [prompt + CoT + 32条SID候选]         │
+│    扩展: [B] → [B×32]                                          │
+│    生成UID: 同一prompt的32条候选共享UID                          │
+│                                                                 │
+│  Step 3: 计算Reward                                             │
+│    对每条候选: compute_score(pred, ground_truth)                │
+│    → {pass_at_1, format_reward, partial_hit, ...}              │
+│    reward放在序列最后一个有效token位置                            │
+│                                                                 │
+│  Step 4: 计算旧策略log概率                                      │
+│    old_log_prob = actor_model(batch).log_prob                   │
+│    (用rollout时的模型快照，不是更新后的)                          │
+│                                                                 │
+│  Step 5: GRPO优势估计                                           │
+│    按UID分组 → 组内标准化                                       │
+│    advantages[i] = (score[i] - mean) / (std + ε)               │
+│                                                                 │
+│  Step 6: 更新Actor (PPO-Clip)                                   │
+│    loss = -min(ρ·A, clip(ρ)·A) + β·KL                          │
+│    loss.backward() → optimizer.step()                           │
+│                                                                 │
+│  Step 7: 指标记录 + 保存检查点                                   │
+│    记录: reward均值, pass@1, loss, KL散度 等                    │
+│    每隔save_freq步保存checkpoint                                 │
+│    每隔test_freq步在验证集上评测                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 7.10 关键超参数
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `stage2_beam_size` | 32 | beam search宽度（每prompt生成32条候选） |
+| `stage1_max_tokens` | 1024 | CoT推理最大长度 |
+| `stage2_max_tokens` | 16 | SID生成最大长度 |
+| `clip_ratio_high` | 0.28 | PPO clip上限 (ratio ≤ 1.28) |
+| `kl_loss_coef` | 0.001 | KL正则系数 β |
+| `total_epochs` | 20 | 训练总epoch数 |
+| `max_prompt_length` | 10240 | prompt最大长度 |
+| `max_response_length` | 2048 | 生成序列最大长度 |
+| `norm_adv_by_std` | True | 是否用标准差标准化优势 |
+| `adv_estimator` | grpo | 优势估计方法 |
+
+### 7.11 RL 中的 0/1 值不是"标签"
+
+一个常见误解：看到 `pass_at_1` 返回 0.0 或 1.0，以为这是在做二元分类。
+
+```
+BCE (二元交叉熵) 的做法:
+  loss = -[y·log(ŷ) + (1-y)·log(1-ŷ)]
+  y ∈ {0, 1} 是硬标签
+  ŷ 是模型直接输出的sigmoid概率
+  → 模型有一个"输出0或1的sigmoid头"
+
+GRPO 的做法:
+  y ∈ {0, 1} 是 rollout 后的 reward
+  先做组内标准化 → 优势 A
+  再乘上已经 rollout 出来的 token 序列的对数概率梯度
+  → 模型没有"输出0或1的头"
+  → 模型依然是自回归生成SID token
+  → reward 只是"权重"，告诉梯度"这个序列好不好"
+
+本质区别:
+  BCE:    模型直接预测标签 → 最小化预测误差
+  GRPO:   模型生成序列 → reward评判 → 策略梯度优化
+```
+
+### 7.12 RL vs Pretrain/SFT 的损失函数对比
+
+| 阶段 | Loss 类型 | 监督信号 | 有无 0/1 label |
+|------|----------|---------|---------------|
+| Pretrain (Stage 1&2) | Token级多分类CE (softmax over V≈176k) | 下一token的id | ❌ 无 |
+| SFT (Stage 3) | Token级多分类CE (仅assistant段) | 下一token的id | ❌ 无 |
+| **RL (Stage 4)** | **策略梯度 (PPO-clip) + KL** | **标量reward** (可能取0/1也可能连续) | ❌ 无 (reward不是label) |
+
+**整条训练管线从头到尾都没有用过二元交叉熵（BCE）。**
+
+### 7.13 一句话总结
+
+```
+Pretrain:  模型学会"SID token的语义 + 序列共现规律"
+SFT:       模型学会"按指令格式回答推荐问题"
+RL/GRPO:   模型学会"推荐用户真正感兴趣的物品"
+           → 自己生成推荐 (rollout)
+           → reward评判好坏
+           → 组内比较谁更好 (GRPO)
+           → 策略梯度更新 (PPO-clip)
+           → 循环迭代，持续改进
+```
+
+---
+
+*最后更新: 2026-07-13*

@@ -1,4 +1,16 @@
+"""
+OneRec 自定义 FSDP Worker
+========================
 
+继承标准的 ActorRolloutRefWorker，将 rollout 组件替换为 OneRecvLLMRollout。
+
+作用:
+  - 标准 Worker 使用 vLLMRollout (一步生成)
+  - OneRec Worker 使用 OneRecvLLMRollout (两阶段生成: CoT采样 + Beam搜索)
+
+在 main_onerec_ppo.py 中被引用:
+  from recipe.onerec.onerec_fsdp_workers import OneRecActorRolloutRefWorker
+"""
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from recipe.onerec.onerec_vllm_rollout import OneRecvLLMRollout
 from verl.utils.fs import copy_to_local
@@ -10,11 +22,18 @@ import torch
 logger = logging.getLogger(__name__)
 
 class OneRecActorRolloutRefWorker(ActorRolloutRefWorker):
-    """
-    Custom ActorRolloutRefWorker that uses OneRecvLLMRollout instead of standard vLLMRollout.
+    """自定义 Worker: 用 OneRecvLLMRollout 替换标准 vLLMRollout。
+
+    只重写 _build_rollout() 方法，其余逻辑 (模型加载、FSDP 分片、训练等)
+    全部继承自父类 ActorRolloutRefWorker。
     """
     def _build_rollout(self, trust_remote_code=False):
-        # We only override the two_stage rollout path
+        """构建 Rollout 组件。
+
+        当 rollout.name == "two_stage" 时，使用自定义的 OneRecvLLMRollout;
+        其他情况回退到父类实现 (标准 vLLMRollout)。
+        """
+        # 只对 two_stage rollout 使用自定义实现
         if self.config.rollout.name == "two_stage":
             from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
             from verl.utils.profiler import log_gpu_memory_usage
@@ -37,9 +56,11 @@ class OneRecActorRolloutRefWorker(ActorRolloutRefWorker):
                 if self._is_lora
                 else {}
             )
-            
-            # Use our custom class!
-            # We check for async mode but currently only support Sync OneRecvLLMRollout
+
+            # 实例化自定义的两阶段 Rollout
+            # OneRecvLLMRollout 继承自 vLLMRollout，重写了 generate_sequences()
+            # 实现 CoT 采样 (Stage 1) + Beam Search (Stage 2) 的两阶段生成
+            # 注意: 异步模式 (async) 暂不支持，回退到父类实现
             if self.config.rollout.mode == "async":
                  logger.warning("OneRecvLLMRollout currently only supports SYNC mode fully. Async might fallback or fail if logic differs.")
                  # If you implemented AsyncOneRecvLLMRollout, use it here.

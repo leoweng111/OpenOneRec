@@ -1,3 +1,19 @@
+"""
+OneRec RL 数据加载与 Reward 函数定义
+=====================================
+
+本文件包含三个核心组件:
+1. collate_fn:        batch 拼接函数，将多条样本合并为一个 batch
+2. OneRecDataset:     RL 训练数据集类，负责加载 parquet 数据并构造 prompt
+3. compute_score:     Reward 函数，评判模型生成的推荐结果好坏
+
+Reward 函数体系:
+  - think_format_reward:   检查 CoT 格式是否正确 (<think>...</think>)
+  - first_sid_hit_reward:  Pass@1 — 第一个推荐物品是否命中 (主 reward)
+  - hit_reward:            整体命中率 — 预测 SID 集合与 ground truth 的交集比例
+  - partial_hit_reward:    层次化部分匹配 — 按码本层级给分 (100/10/1/0)
+  - pass_rate:             二值 — 是否有任何 SID 命中
+"""
 from __future__ import annotations
 
 import ast
@@ -22,7 +38,13 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["collate_fn", "OneRecDataset", "compute_score"]
 
+
 def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """将多条样本拼接为一个 batch。
+
+    Tensor 类型的字段 (input_ids, attention_mask 等) 用 torch.stack 堆叠;
+    非 Tensor 字段 (ground_truth, data_source 等) 用 numpy object 数组保存。
+    """
     tensors: dict[str, list[torch.Tensor]] = defaultdict(list)
     non_tensors: dict[str, list[Any]] = defaultdict(list)
 
@@ -44,6 +66,20 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 class OneRecDataset(Dataset):
+    """OneRec RL 训练数据集。
+
+    数据格式 (parquet 每行):
+      messages: [{"role": "system", ...}, {"role": "user", ...}, {"role": "assistant", ...}]
+
+    数据加载流程:
+      1. 读取 parquet 文件
+      2. _extract_prompt_fields(): 分离 prompt (system+user) 和 ground_truth (assistant)
+      3. __getitem__(): tokenize prompt, 构造训练样本
+
+    与 SFT 数据的关键区别:
+      - SFT: 模型看到 system+user 后学习模仿 assistant 的回答
+      - RL:  模型看到 system+user 后自己生成回答，然后由 reward 函数评判好坏
+    """
     def __init__(
         self,
         data_files: str | list[str],
@@ -130,6 +166,13 @@ class OneRecDataset(Dataset):
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
     def _extract_prompt_fields(self, row: dict[str, Any]) -> dict[str, Any]:
+        """从 messages 中分离 prompt 和 ground_truth。
+
+        处理逻辑:
+          - prompt_messages = messages[:-1]   (system + user，作为模型输入)
+          - ground_truth = messages[-1]       (assistant 的内容，作为 reward 评判标准)
+          - 根据配置在 user 消息末尾追加 /think 或 /no_think 后缀
+        """
         raw_messages = row.get("messages")
         if isinstance(raw_messages, str):
             messages = ast.literal_eval(raw_messages)
@@ -371,10 +414,25 @@ class OneRecDataset(Dataset):
         return self.__dict__.copy()
 
 
+# ============================================================================
+# Reward 函数体系
+# ============================================================================
+# 以下函数评判模型生成的推荐结果 (prediction) 与正确答案 (ground_truth) 的匹配程度。
+# 每个函数返回一个标量 reward，用于 GRPO 优势估计。
+#
+# SID 格式: <s_a_X><s_b_Y><s_c_Z>  (三层码本的离散编码)
+# 例如: <s_a_42><s_b_15><s_c_89> 表示一个物品的语义ID
+
+# 正则表达式: 匹配 SID 三元组 (s_a, s_b, s_c)
 SLOT_PATTERN = re.compile(r"<s_a_(\d+)><s_b_(\d+)><s_c_(\d+)>")
 
 
 def _extract_all_tuples(text: Any) -> list[tuple[str, str, str]]:
+    """从文本中提取所有 SID 三元组。
+
+    例如: "...<s_a_42><s_b_15><s_c_89>...<s_a_7><s_b_33><s_c_201>..."
+      → [("42", "15", "89"), ("7", "33", "201")]
+    """
     if not isinstance(text, str):
         logger.warning("_extract_all_tuples received non-string input: %s", type(text))
         return []
@@ -384,13 +442,14 @@ def _extract_all_tuples(text: Any) -> list[tuple[str, str, str]]:
 
 
 def think_format_reward(prediction: str) -> float:
-    """Check if prediction contains valid think format.
+    """格式奖励: 检查模型是否遵循了 <think>...</think> 的推理格式。
 
-    Args:
-        prediction: Model prediction text.
+    评判标准:
+      - 必须包含 <think> 和 </think> 标签
+      - 标签内的内容 (去除空白后) 长度必须 > 10 个字符
+      → 防止模型生成空的 </think> 来"骗"奖励
 
-    Returns:
-        1.0 if contains valid <think>...</think> with content length > 10, else 0.0.
+    返回: 1.0 (格式正确) 或 0.0 (格式错误)
     """
     if "<think>" not in prediction or "</think>" not in prediction:
         return 0.0
@@ -408,19 +467,20 @@ def think_format_reward(prediction: str) -> float:
 
 
 def partial_hit_reward(prediction: str, ground_truth: str) -> float:
-    """Calculate hierarchical matching reward with partial match support.
+    """层次化部分匹配奖励 — GRPO 中提供"方向正确"的梯度信号。
 
-    Args:
-        prediction: Model prediction text, may contain multiple sids.
-        ground_truth: Ground truth text, may contain multiple sids.
+    即使模型没有完全命中目标物品，只要码本的部分层级匹配了，也能获得正向奖励:
+      - s_a + s_b + s_c 全部匹配 → 100 分 (完全命中)
+      - s_a + s_b 匹配           → 10 分  (粗粒度+中粒度对了)
+      - 仅 s_a 匹配              → 1 分   (粗粒度对了)
+      - 都不匹配                 → 0 分
 
-    Returns:
-        Weighted match score:
-        - Full match (s_a, s_b, s_c): 100 points
-        - s_a and s_b match: 10 points
-        - Only s_a match: 1 point
-        - No match: 0 points
-        Returns average score across all predicted sids.
+    设计动机:
+      pass@1 只返回 0 或 1，信号极度稀疏。32 条 beam 中大部分都没命中 → 全得 0。
+      partial_hit_reward 给出"部分匹配"的梯度信号，让模型知道"方向是对的"，
+      即使没完全命中也能学到有用的信息。
+
+    返回: 所有预测 SID 的平均匹配分数。
     """
     pred_tuples = _extract_all_tuples(prediction)
     gt_tuples = _extract_all_tuples(ground_truth)
@@ -451,14 +511,12 @@ def partial_hit_reward(prediction: str, ground_truth: str) -> float:
     return total_reward / len(pred_tuples)
 
 def hit_reward(prediction: str, ground_truth: str) -> float:
-    """Calculate hit reward: intersection ratio between prediction and ground truth.
+    """整体命中率奖励: 预测 SID 集合与 ground truth 的交集比例。
 
-    Args:
-        prediction: Model prediction text, may contain multiple sids.
-        ground_truth: Ground truth text, may contain multiple sids.
+    计算方式: |预测 ∩ 正确| / |预测|
+    只统计 </think> 之后的 SID (推理结果部分)。
 
-    Returns:
-        Hit reward: intersection count / prediction count.
+    返回: [0, 1] 连续值，1.0 表示所有预测的 SID 都命中。
     """
     if "</think>" in prediction and "<think>" in prediction:
         think_end_idx = prediction.find("</think>") + len("</think>")
@@ -477,14 +535,12 @@ def hit_reward(prediction: str, ground_truth: str) -> float:
     return len(pred_set & gt_set) / len(pred_tuples)
 
 def first_sid_hit_reward(prediction: str, ground_truth: str) -> float:
-    """Calculate Pass@1 reward: whether the first sid after </think> hits ground truth.
+    """Pass@1 奖励 (主 reward): 模型推荐的第一个物品是否命中 ground truth。
 
-    Args:
-        prediction: Model prediction text.
-        ground_truth: Ground truth text.
+    这是 compute_score 返回的 "score" 字段，是 GRPO 优势估计的主要信号。
+    只检查 </think> 之后第一个 SID 三元组。
 
-    Returns:
-        1.0 if first sid is in ground truth, else 0.0.
+    返回: 1.0 (命中) 或 0.0 (未命中)
     """
     # Extract content after </think>
     if "</think>" in prediction and "<think>" in prediction:
@@ -509,14 +565,9 @@ def first_sid_hit_reward(prediction: str, ground_truth: str) -> float:
     return float(first_pred_tuple in gt_set)
 
 def pass_rate(prediction: str, ground_truth: str) -> float:
-    """Calculate pass rate: whether prediction and ground truth have intersection.
+    """通过率: 预测集合与 ground truth 是否有交集 (二值)。
 
-    Args:
-        prediction: Model prediction text, may contain multiple sids.
-        ground_truth: Ground truth text, may contain multiple sids.
-
-    Returns:
-        1.0 if there is intersection, else 0.0.
+    返回: 1.0 (至少一个 SID 命中) 或 0.0 (全部未命中)
     """
     pred_tuples = _extract_all_tuples(prediction)
     gt_tuples = _extract_all_tuples(ground_truth)
@@ -538,16 +589,21 @@ def compute_score(
     ground_truth: str,
     extra_info: dict[str, Any],  # noqa: ARG001
 ) -> dict[str, float]:
-    """Compute reward scores for recommendation results.
+    """计算推荐结果的 reward 分数 — RL 训练的核心评判函数。
 
-    Args:
-        data_source: Data source identifier (kept for API compatibility).
-        solution_str: Model generated prediction text.
-        ground_truth: Ground truth text.
-        extra_info: Extra information (kept for API compatibility).
+    本函数由 run_grpo.sh 中 custom_reward_function.path/name 指定，
+    在训练循环的 "Step 3: 计算Reward" 阶段被调用。
 
-    Returns:
-        Dictionary containing various reward scores.
+    参数:
+        data_source: 数据来源标识 (如 "RecIF_VideoRec")，当前未使用
+        solution_str: 模型生成的完整输出 (CoT推理 + SID序列)
+        ground_truth: 正确的 SID 序列字符串
+        extra_info:   额外信息，当前未使用
+
+    返回:
+        字典，包含多个 reward 指标:
+        - "score" (主 reward): pass_at_1，用于 GRPO 优势估计
+        - 其余为监控指标，记录到 wandb/tensorboard
     """
     prediction = solution_str
     format_reward_value = think_format_reward(prediction)

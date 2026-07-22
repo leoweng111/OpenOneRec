@@ -30,13 +30,22 @@
 - [6. RQ-OPQ混合方法（串行+并行）](#6-rq-opq混合方法串行并行)
   - [6.1 设计动机](#61-设计动机)
   - [6.2 OneSearch：快手电商搜索](#62-onesearch快手电商搜索)
-- [7. 协同对齐方法](#7-协同对齐方法)
-  - [7.1 DAS：快手双对齐语义ID](#71-das快手双对齐语义id)
+- [7. 语义ID对齐方法](#7-语义id对齐方法)
+  - [7.1 为什么需要对齐？](#71-为什么需要对齐)
+  - [7.2 QARM：快手前置对齐](#72-qarm快手前置对齐)
+  - [7.3 DAS：快手一阶段联合对齐](#73-das快手一阶段联合对齐)
+  - [7.4 PLUM SID-v2：共现对比对齐](#74-plum-sid-v2共现对比对齐)
+  - [7.5 MMQ：后置行为感知微调](#75-mmq后置行为感知微调)
+  - [7.6 UniSID：端到端联合优化](#76-unisid端到端联合优化)
+  - [7.7 DIGER：可微分对齐](#77-diger可微分对齐)
+  - [7.8 无显式对齐的方法](#78-无显式对齐的方法)
+  - [7.9 对齐方法对比总结](#79-对齐方法对比总结)
 - [8. 稀疏+稠密级联方法](#8-稀疏稠密级联方法)
   - [8.1 COBRA：百度级联表示](#81-cobra百度级联表示)
 - [9. 端到端语义ID生成与LLM适配](#9-端到端语义id生成与llm适配)
-  - [9.1 UniSID：广告推荐端到端生成](#91-unisid广告推荐端到端生成)
+  - [9.1 UniSID：广告推荐端到端生成](#91-腾讯unisid广告推荐端到端生成)
   - [9.2 PLUM：LLM适配生成式推荐](#92-plumllm适配生成式推荐)
+  - [9.3 DIGER：可微分语义ID端到端联合优化](#93-diger可微分语义id端到端联合优化)
 - [10. 工业基准](#10-工业基准)
   - [10.1 FORGE：淘宝大规模基准](#101-forge淘宝大规模基准)
 - [11. 多模态语义ID构造专题](#11-多模态语义id构造专题)
@@ -71,13 +80,16 @@
 
 ### 1.2 语义ID的核心原理：从连续到离散
 
-语义ID的生成本质上是一个**向量量化（Vector Quantization）** 过程。核心流程如下：
+语义ID的生成涉及两个核心环节：**量化（Quantization）** 和**对齐（Alignment）**。核心流程如下：
 
 ```
-物品多模态特征 → Encoder → 连续向量 z → 量化器 → 离散码 (c₁, c₂, ..., c_L)
-                                                          ↓
-                                                     语义ID (Semantic ID)
+物品多模态特征 → [对齐: 融合协同信号] → Encoder → 连续向量z → 量化器 → 离散码 (c₁, c₂, ..., c_L)
+                                                                          ↓
+                                                                     语义ID (Semantic ID)
 ```
+
+- **量化**：将连续向量离散化为码本索引序列（详见§1.3 RQ-VAE）
+- **对齐**：弥合内容语义与协同过滤信号之间的gap（详见§7 对齐方法），可在量化前、量化中、量化后或端到端进行
 
 **数学框架**：给定物品 $i$，其特征经过编码器得到连续向量 $\mathbf{z}_i \in \mathbb{R}^d$。量化的目标是找到一组离散码 $\mathbf{c}_i = (c_1, c_2, \ldots, c_L)$，使得从离散码重构的向量 $\hat{\mathbf{z}}_i$ 尽可能接近 $\mathbf{z}_i$。
 
@@ -89,8 +101,8 @@
 
 ```
 ┌─────────┐     ┌──────────────┐     ┌──────────────────┐     ┌─────────┐
-│  输入    │     │   Encoder    │     │ 残差量化模块(RQ)  │     │ Decoder │
-│  x ∈ R^D │ ──→ │  f_enc(x)=z  │ ──→ │  z → (c₁,...,cL) │ ──→ │  重构 x̂  │
+│  输入    │     │   Encoder    │     │ 残差量化模块(RQ)   │     │ Decoder │
+│  x ∈ R^D│ ──→ │  f_enc(x)=z  │ ──→ │  z → (c₁,...,cL) │ ──→ │  重构 x̂  │
 └─────────┘     └──────────────┘     └──────────────────┘     └─────────┘
                                               ↑
                                     L层码本 {C₁, C₂, ..., C_L}
@@ -221,7 +233,7 @@ LLM Encoder (frozen) → dense_emb ∈ R^d → 缓存 → 拼接到DLRM输入
 - **问题**：
   - LLM embedding存储在缓存中，作为**固定输入**，无法通过推荐模型梯度更新
   - 需要先过一个参数可学习的对齐网络，再用用户交互信号对齐，才能在下游使用
-  - 对下游训练不友好，表征与推荐目标存在gap
+  - 对下游训练不友好，表征与推荐目标存在gap（一般只能做双阶段训练）
 
 **阶段二：多模态Embedding作为ID初始化（中期尝试）**
 
@@ -238,19 +250,35 @@ LLM Encoder (frozen) → dense_emb ∈ R^d → 缓存 → 拼接到DLRM输入
 
 **阶段三：量化为离散语义ID（当前主流）** ✅
 
-将LLM encoder输出的embedding进行**量化**，得到离散的语义ID，然后在下游推荐模型中使用语义ID作为特征输入。
+**为什么阶段三比阶段一更好？**
 
-```
-LLM Encoder → dense_emb ∈ R^d → 量化器(RQ-VAE/RQ-KMeans) → 语义ID (c₁, c₂, ..., c_L)
-                                                                  ↓
-                                                     SID Embedding Table (可学习)
-                                                                  ↓
-                                                     拼接到DLRM → CTR预估
-```
+阶段一（冻结Dense特征直接拼接）存在几个核心问题，而阶段三（量化为离散语义ID）通过**信息压缩+离散化**巧妙解决了这些问题：
 
-- **代表工作**：[QARM](https://arxiv.org/abs/2411.11739)（快手）、[YouTube Semantic IDs](https://arxiv.org/abs/2306.08121)（Google）、[SIDE](https://arxiv.org/abs/2506.16698)（Meta）
+| 维度 | 阶段一：冻结Dense特征 | 阶段三：量化为离散语义ID | 优势来源 |
+|------|---------------------|------------------------|----------|
+| **存储开销** | 每个物品存储 768~4096 维浮点向量 | 每个物品仅需 $L$ 个整数（如 3 个 token） | 存储减少 1000×+ |
+| **计算效率** | 拼接高维向量，下游模型输入维度大 | 查小 Embedding Table，维度可控 | 训练/推理更快 |
+| **可训练性** | Dense 特征冻结，无法通过推荐梯度更新 | SID Embedding 可端到端学习 | 表征与目标对齐 |
+| **泛化能力** | 向量空间连续，相似物品距离近但无共享参数 | 相似物品共享 token，实现参数级泛化 | 语义层次结构 |
+| **冷启动** | 新物品需先过 Encoder，表征与推荐目标有 gap | 新物品基于内容获得有意义 SID，立即可用 | 内容驱动 ID |
+| **LLM 兼容** | Dense 向量难以融入 LLM 词表 | 离散 token 自然融入 LLM 词表扩展 | 统一建模 |
+
+**核心洞察**：
+
+1. **信息压缩的本质**：高维 Dense Embedding 包含大量冗余信息（维度间高度相关），量化通过**残差逐层编码**将信息压缩到最关键的语义维度，实现"去冗余、保语义"。
+
+2. **离散化的价值**：
+   - **参数共享**：相似物品共享部分 token（如前缀相同），对应的 Embedding 参数被多个物品共用，实现**隐式正则化**和**语义泛化**
+   - **组合爆炸**：$L$ 层码本每层 $K$ 个码字，可表达 $K^L$ 种组合（如 $256^3 = 1677$ 万），远大于实际物品数，保证唯一性的同时实现层次语义
+
+3. **与 LLM 的天然契合**：LLM 本身就是处理离散 token 序列的模型，将物品表示为离散 SID token 后，可以：
+   - 直接复用 LLM 的 Transformer 架构和训练范式（预训练 + 微调）
+   - 统一处理文本和物品的多模态序列（如 "用户画像 + 历史 SID 序列 → 生成目标 SID"）
+   - 利用 LLM 的世界知识和推理能力增强推荐
+
+**代表工作**：[QARM](https://arxiv.org/abs/2411.11739)（快手）、[YouTube Semantic IDs](https://arxiv.org/abs/2306.08121)（Google）、[SIDE](https://arxiv.org/abs/2506.16698)（Meta）
 - **两阶段训练**：
-  1. **第一阶段**：训练量化器（RQ-VAE、RQ-KMeans等），得到物品的语义ID
+  1. **第一阶段**：训练量化器（RQ-VAE、RQ-KMeans等），得到物品的语义ID，一般也会加入对比学习对齐语义和协同空间
   2. **第二阶段**：训练下游推荐模型，使用语义ID作为离散特征输入
 - **关键特性**：
   - 语义ID对应的**码本是固定的**，不在下游训练中更新 → 避免大规模embedding table的存储/计算开销
@@ -286,18 +314,18 @@ LLM Encoder → dense_emb ∈ R^d → 量化器(RQ-VAE/RQ-KMeans) → 语义ID (
 
 **代表论文概览**：
 
-| 论文 | 链接 | 量化方法 | 生成方式 | 核心贡献 |
-|------|------|----------|----------|----------|
+| 论文                                            | 链接 | 量化方法 | 生成方式 | 核心贡献 |
+|-----------------------------------------------|------|----------|----------|----------|
 | [TIGER](#21-tiger奠基工作) (Google, NeurIPS 2023) | [arXiv:2305.05065](https://arxiv.org/abs/2305.05065) | RQ-VAE | 串行 | 奠基工作，首次提出语义ID+生成式检索 |
-| [OneRec](#34-onerec快手统一生成式推荐) (快手, 2025) | [arXiv:2502.18965](https://arxiv.org/abs/2502.18965) | RQ-KMeans | 串行 | 统一检索排序+多级别衡量化 |
-| [OneRec V2](#34-onerec快手统一生成式推荐) (快手, 2025) | [arXiv:2508.20900](https://arxiv.org/abs/2508.20900) | RQ-KMeans | 串行 | Lazy Decoder-Only, 80亿参数 |
-| [RPG](#52-rpgmeta并行语义id生成) (Meta, KDD 2025) | [arXiv:2506.05781](https://arxiv.org/abs/2506.05781) | OPQ | 并行 | 一步并行生成全部语义ID |
-| [OneSearch](#62-onesearch快手电商搜索) (快手, 2025) | [arXiv:2509.03236](https://arxiv.org/abs/2509.03236) | RQ-OPQ | 混合 | RQ串行+OPQ并行，电商搜索 |
-| [PLUM](#92-plumllm适配生成式推荐) (Google, 2025) | [arXiv:2510.07784](https://arxiv.org/abs/2510.07784) | SID-v2 (RQ-VAE+对比损失) | 串行 | 预训练LLM适配生成式推荐，SID离线构造 |
-| [UniSID](#91-unisid广告推荐端到端生成) (2026) | [arXiv:2602.10445](https://arxiv.org/abs/2602.10445) | 端到端 | 串行 | 端到端联合优化embedding和SID |
-| [DIGER](#23-diger可微分语义id) (SIGIR 2026) | [arXiv:2601.19711](https://arxiv.org/abs/2601.19711) | 可微分RQ | 串行 | Gumbel-Softmax可微分量化 |
-| [COBRA](#81-cobra百度级联表示) (百度, 2025) | [arXiv:2503.02453](https://arxiv.org/abs/2503.02453) | 级联 | 级联 | 稀疏语义ID+稠密向量级联 |
-| [MMQ](#44-mmq多模态混合量化) (WSDM 2026) | [arXiv:2502.16077](https://arxiv.org/abs/2502.16077) | MoE | 并行 | 多模态专家混合量化 |
+| [OneRec](#34-onerec快手统一生成式推荐) (快手, 2025)      | [arXiv:2502.18965](https://arxiv.org/abs/2502.18965) | RQ-KMeans | 串行 | 统一检索排序+多级别衡量化 |
+| [OneRec V2](#34-onerec快手统一生成式推荐) (快手, 2025)   | [arXiv:2508.20900](https://arxiv.org/abs/2508.20900) | RQ-KMeans | 串行 | Lazy Decoder-Only, 80亿参数 |
+| [RPG](#52-rpgmeta并行语义id生成) (Meta, KDD 2025)   | [arXiv:2506.05781](https://arxiv.org/abs/2506.05781) | OPQ | 并行 | 一步并行生成全部语义ID |
+| [OneSearch](#62-onesearch快手电商搜索) (快手, 2025)   | [arXiv:2509.03236](https://arxiv.org/abs/2509.03236) | RQ-OPQ | 混合 | RQ串行+OPQ并行，电商搜索 |
+| [PLUM](#92-plumllm适配生成式推荐) (Google, 2025)     | [arXiv:2510.07784](https://arxiv.org/abs/2510.07784) | SID-v2 (RQ-VAE+对比损失) | 串行 | 预训练LLM适配生成式推荐，SID离线构造 |
+| [UniSID](#91-unisid广告推荐端到端生成) (2026)          | [arXiv:2602.10445](https://arxiv.org/abs/2602.10445) | 端到端 | 串行 | 端到端联合优化embedding和SID |
+| [DIGER](#23-diger可微分语义id) (SIGIR 2026)        | [arXiv:2601.19711](https://arxiv.org/abs/2601.19711) | 可微分RQ | 串行 | Gumbel-Softmax可微分量化 |
+| [COBRA](#81-cobra百度级联表示) (百度, 2025)           | [arXiv:2503.02453](https://arxiv.org/abs/2503.02453) | 级联 | 级联 | 稀疏语义ID+稠密向量级联 |
+| [MMQ](#44-mmq多模态混合量化) (阿里, 2025)               | [arXiv:2508.15281](https://arxiv.org/abs/2508.15281) | MoE | 并行 | 多模态专家混合量化 |
 
 #### 1.4.3 两种范式对比
 
@@ -360,7 +388,7 @@ Hybrid: [c₁ → c₂ → c₃] (串行, 粗粒度层次) + [p₁, p₂, ..., p
 
 **代表方法**：RQ-OPQ（OneSearch）
 
-### 1.6 语义ID方法演进总览
+### 1.6 语义ID方法部分时间线
 
 ```
 2022  VQ-Rec ─────────────────────── PQ (乘积量化, 并行)
@@ -371,7 +399,7 @@ Hybrid: [c₁ → c₂ → c₃] (串行, 粗粒度层次) + [p₁, p₂, ..., p
        │
 2024  QARM (快手) ───────────────── RQ-KMeans + 多模态对齐 (串行)
        │
-2025  OneRec (快手) ─────────────── RQ-KMeans + 多级别衡 (串行)
+2025  OneRec (快手) ─────────────── RQ-KMeans + 多级别平衡 (串行)
        │
 2025  RPG (Meta) ────────────────── OPQ (并行)
        │
@@ -421,8 +449,13 @@ RQ-VAE = Encoder（神经网络） + 残差量化（最近邻查找） + Decoder
 **语义ID生成**（离线训练）：
 
 ```
-物品文本特征 → SBERT (frozen, d=768) → RQ-VAE Encoder → 残差量化(3层, K=4096) → (c₁, c₂, c₃)
+物品文本特征 → SBERT (frozen, d=768) → RQ-VAE Encoder (可训练) → 残差量化(3层, K=4096) → (c₁, c₂, c₃)
+                  ↑                         ↑
+             外层Encoder               内层Encoder
+             (冻结,产出内容embedding)   (可训练,映射到量化空间)
 ```
+
+> **关于Encoder**：TIGER有**两层Encoder**。外层SBERT（冻结）负责将物品文本编码为内容embedding；内层RQ-VAE自带的Encoder（可训练）将内容embedding映射到量化空间。RQ-VAE的Encoder、Decoder和码本通过重构损失+码本损失+承诺损失端到端联合训练。这与RQ-KMeans方案（如OneRec）有本质区别——RQ-KMeans没有内层Encoder，直接在frozen embedding上做聚类（详见§3.1对比表）。
 
 **生成式检索**（在线推理）：
 ```
@@ -535,10 +568,15 @@ def residual_kmeans(embeddings, num_levels=L, num_clusters=K):
 |------|----------------|-------------------------|
 | 量化方法 | 神经网络 + 最近邻查找 | K-Means聚类 |
 | 码本学习 | 端到端梯度更新 | 迭代聚类中心更新 |
+| **量化器内部Encoder** | **✅ 有，可训练（映射到量化空间）** | **❌ 无（直接在frozen embedding上聚类）** |
+| **Decoder** | **✅ 有，可训练（重构输入）** | **❌ 无** |
+| 初始内容Encoder | 冻结（SBERT等） | 冻结（多模态模型） |
 | 输入来源 | 单一frozen embedding | 对齐后的多模态embedding |
 | 训练复杂度 | 高（需训练VAE） | 低（仅K-Means） |
 | 工业部署 | 较重 | 轻量 |
 | 码本平衡性 | 可能出现不均匀 | K-Means天然更均衡 |
+
+> **关于Encoder的关键区别**：两种方法的初始内容Encoder（SBERT/CLIP/多模态模型）都是**冻结**的。但RQ-VAE自带一个**可训练的Encoder/Decoder**——外层frozen embedding先经过RQ-VAE的Encoder映射到量化空间，再查码本、再经Decoder重构。而RQ-KMeans**没有**这个内层Encoder/Decoder，直接在frozen embedding上做K-Means聚类。这也是RQ-KMeans更轻量的原因之一。
 
 **RQ-KMeans的优势**（被OneRec等工作验证）：
 - **重构质量**：K-Means直接最小化量化误差
@@ -807,7 +845,7 @@ for m in range(M):
 |------|----------|----------|----------|
 | [VQ-Rec](https://arxiv.org/abs/2210.12316) (2022) | LLM4DLRMs/预训练 | 并行(PQ) | 可迁移序列推荐 |
 | [SIDE](https://arxiv.org/abs/2506.16698) (Meta, 2025) | LLM4DLRMs | 并行(VQ) | 无参数SID转换，广告序列 |
-| [MMQ](https://arxiv.org/abs/2502.16077) (2025) | LLM4GRs | 并行(MoE) | 多模态专家混合量化 |
+| [MMQ](https://arxiv.org/abs/2508.15281) (2025) | LLM4GRs | 并行(MoE) | 多模态专家混合量化 |
 
 ### 4.3 VQ-Rec：可迁移序列推荐
 
@@ -863,13 +901,13 @@ for m in range(M):
 
 ### 4.5 MMQ：多模态混合量化
 
-- **标题**：[MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation](https://arxiv.org/abs/2502.16077)
+- **标题**：[MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation](https://arxiv.org/abs/2508.15281)
 - **发表**：WSDM 2026
-- **arXiv**：https://arxiv.org/abs/2502.16077
+- **arXiv**：https://arxiv.org/abs/2508.15281
 - **使用范式**：**LLM4GRs**
 - **构造范式**：**并行**（MoE混合量化）
 
-**核心创新**：使用**Mixture-of-Experts (MoE)** 架构进行量化：
+**核心创新**：使用**Mixture-of-Experts (MoE)** 架构对多个模态表征动态加权，进行量化：
 
 ```
 输入embedding → Router → 分配权重
@@ -1058,67 +1096,236 @@ $$\mathcal{L}_{\text{RPG}} = \mathcal{L}_{\text{OPQ}} + \lambda \mathcal{L}_{\te
 
 ---
 
-## 7. 协同对齐方法
+## 7. 语义ID对齐方法
 
-**核心问题**：语义ID从内容特征量化而来，只包含内容语义，不包含协同过滤信号（用户-物品交互模式）。这导致语义ID与推荐目标不一致。（LLM文本知识空间和推荐系统协同空间）
+**核心问题**：语义ID从内容特征量化而来，只包含**内容语义**（物品是什么），不包含**协同过滤信号**（用户-物品交互模式）。这导致语义ID与推荐目标之间存在**语义-行为gap（Semantic-Behavioral Gap）**——两个内容相似的物品可能有截然不同的用户交互模式，反之亦然。
 
-### 采用协同对齐方法的论文
+对齐（Alignment）的目标是弥合这一gap，使语义ID不仅反映物品内容相似性，还能反映用户行为相似性。
 
-| 论文 | 使用范式 | 核心改进 |
-|------|----------|----------|
-| [DAS](https://arxiv.org/abs/2508.10584) (快手, 2025) | LLM4DLRMs / LLM4GRs | 一阶段双对齐，融入协同信号 |
+### 采用对齐方法的论文总览
 
-### 7.1 DAS：快手双对齐语义ID
+| 论文 | 对齐时机 | 对齐方法 | 核心改进 |
+|------|----------|---------|----------|
+| [QARM](#72-qarm快手前置对齐) (快手, 2024) | Pre-alignment | MLLM微调+Batch对比损失 | 多模态表示与业务交互对齐 |
+| [DAS](#73-das快手一阶段联合对齐) (快手, 2025) | Joint (一阶段) | 多视角对比+CF去偏 | 去偏CF信号+六路对比对齐 |
+| [PLUM SID-v2](#74-plum-sid-v2共现对比对齐) (Google, 2025) | Joint (量化中) | 共现对比损失 | 轻量级单损失注入协同信号 |
+| [MMQ](#75-mmq后置行为感知微调) (阿里, 2025) | Post-alignment | 动态码本调整 | 推荐梯度微调码本聚类 |
+| [UniSID](#76-unisid端到端联合优化) (2026) | End-to-end | 多粒度对比学习 | embedding和SID联合优化 |
+| [DIGER](#77-diger可微分对齐) (SIGIR 2026) | End-to-end | Gumbel-Softmax可微量化 | 推荐梯度直接优化码本 |
+| TIGER, OneRec | 无显式对齐 | — | 纯内容量化，CF信号在后续预训练中学 |
 
-- **标题**：[DAS: Dual-Aligned Semantic IDs Empowered Industrial Recommender System](https://arxiv.org/abs/2508.10584)
-- **机构**：快手
-- **发表**：arXiv 2025年8月
-- **arXiv**：https://arxiv.org/abs/2508.10584
-- **使用范式**：**LLM4DLRMs / LLM4GRs**（兼容判别式和生成式推荐）
-- **构造范式**：兼容多种量化方法
+#### 对齐时机分类
+
+```
+语义ID对齐的四种时机:
+
+  Pre-alignment (量化前对齐):
+    先对齐多模态Encoder → 再量化对齐后的embedding
+    代表: QARM (MLLM微调)
+    
+  Joint alignment (量化中联合对齐):
+    对齐损失作为量化训练的一部分，联合优化
+    代表: DAS (一阶段), PLUM SID-v2 (共现对比损失)
+    
+  Post-alignment (量化后对齐):
+    先完成内容量化 → 再用推荐信号微调码本
+    代表: MMQ Stage 2 (行为感知微调)
+    
+  End-to-end (端到端):
+    不分离量化和对齐，推荐目标直接驱动SID生成
+    代表: UniSID (联合优化), DIGER (可微量化)
+```
+
+### 7.1 为什么需要对齐？
+
+```
+问题: 语义-行为gap
+
+  内容空间:                行为空间:
+  猫视频A ←相似→ 猫视频B   用户常看A后看C(搞笑狗)
+  猫视频A ←相似→ 猫视频D   用户从不看A后看B
+  
+  纯内容SID:              理想SID:
+  A, B, D 共享前缀        A, C 应共享前缀
+  A, C 前缀不同           B, D 可以有不同前缀
+  
+  → 对齐就是让SID同时反映"内容相似"和"行为相似"
+```
+
+### 7.2 QARM：快手前置对齐
+
+- **论文**：[QARM: Quantitative Alignment Multi-Modal Recommendation at Kuaishou](https://arxiv.org/abs/2411.11739)
+- **对齐时机**：**Pre-alignment**（量化前对齐多模态Encoder）
+
+**解决的两个核心问题**：
+1. **Representation Unmatching**：预训练多模态模型（如CLIP）由通用NLP/CV任务监督，而推荐模型由用户-物品交互监督，两者的表示空间不一致
+2. **Representation Unlearning**：多模态表示通常作为冻结缓存输入，无法被推荐模型的梯度更新
+
+**对齐方法**：用业务交互数据微调多模态大语言模型（MLLM）
+
+```
+QARM 前置对齐流程:
+
+  Step 1: 构造对齐训练数据
+    ├── User2Item Retrieval: 用户点击的trigger→target物品对
+    │   (trigger = 用户最近50次点击中与target最相似的物品)
+    └── Item2Item Retrieval: 已有检索模型(Swing)的稳定相似物品对
+    
+  Step 2: MLLM微调 (对齐)
+    ├── M_trigger = MLLM(text, audio, image of trigger)
+    ├── M_target  = MLLM(text, audio, image of target)
+    └── L_align = Batch-Contrastive(M_trigger, M_target, B)
+        → 鼓励行为相似的trigger-target对具有相近的多模态表示
+        → 推开batch内不相关的物品
+        
+  Step 3: 量化 (使用对齐后的表示)
+    └── 对齐后的embedding → RQ-KMeans → SID
+```
+
+**关键特点**：利用已有检索模型（如Swing）的知识来监督对齐，将协同过滤信号注入多模态Encoder，然后对对齐后的表示做量化。
+
+### 7.3 DAS：快手一阶段联合对齐
+
+- **论文**：[DAS: Dual-Aligned Semantic IDs Empowered Industrial Recommender System](https://arxiv.org/abs/2508.10584)
+- **对齐时机**：**Joint alignment**（量化、CF建模、对齐三者一阶段联合训练）
 - **参考讲解**：https://zhuanlan.zhihu.com/p/1943035654511494581
 
 **DAS架构**：
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   DAS 架构                       │
-│                                                 │
-│  ┌─────────────────┐  ┌─────────────────────┐  │
-│  │ User Semantic    │  │ Item Semantic        │  │
-│  │ Model            │  │ Model                │  │
-│  │ (量化用户特征)    │  │ (量化物品特征)        │  │
-│  └────────┬────────┘  └──────────┬───────────┘  │
-│           ↓                      ↓              │
-│  ┌────────────────────────────────────────┐     │
-│  │     ID-based CF Debias Module           │     │
-│  │  (协同过滤去偏模块 — 注入交互信号)         │     │
-│  └────────┬───────────────────────────────┘     │
-│           ↓                                      │
-│  ┌────────────────────────────────────────┐     │
-│  │     Multi-View Contrastive Alignment    │     │
-│  │  (多视角对比对齐)                        │     │
-│  │                                         │     │
-│  │  • Dual u2i: 用户→物品对齐               │     │
-│  │  • Dual i2i/u2u: 物品→物品/用户→用户     │     │
-│  │  • Dual co-occur: 共现物品/用户对齐       │     │
-│  └────────────────────────────────────────┘     │
-│           ↓                                      │
-│  ┌────────────────────────────────────────┐     │
-│  │     Dual Learning (双向学习)             │     │
-│  │  用户量化 ↔ 物品量化 对偶训练             │     │
-│  └────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                    DAS 一阶段联合对齐                      │
+│                                                          │
+│  ┌─────────────────┐  ┌─────────────────────┐           │
+│  │ User Semantic    │  │ Item Semantic        │           │
+│  │ Model (UISM)     │  │ Model (UISM)         │           │
+│  │ PLM→RQ-VAE量化   │  │ PLM→RQ-VAE量化       │           │
+│  │ z_u (用户SID)    │  │ z_i (物品SID)        │           │
+│  └────────┬────────┘  └──────────┬───────────┘           │
+│           ↓                      ↓                       │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │    ICDM: ID-based CF Debias Module                │   │
+│  │    协同过滤去偏模块                                 │   │
+│  │                                                   │   │
+│  │    用户侧: c_u = MLP(c_u^int ⊕ c_u^con)          │   │
+│  │      c_u^int = 无偏用户兴趣                        │   │
+│  │      c_u^con = 用户从众偏差                        │   │
+│  │                                                   │   │
+│  │    物品侧: c_i = MLP(c_i^pro ⊕ c_i^pop)          │   │
+│  │      c_i^pro = 无偏物品内容                        │   │
+│  │      c_i^pop = 物品流行度偏差                      │   │
+│  │                                                   │   │
+│  │    去偏约束: 正交损失 (兴趣⊥从众, 内容⊥流行度)     │   │
+│  └──────────────────────┬───────────────────────────┘   │
+│                         ↓                                │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │    MDAM: Multi-View Contrastive Alignment         │   │
+│  │    多视角对比对齐 (六路对比损失)                     │   │
+│  │                                                   │   │
+│  │    ① Dual U2I: z_u ↔ c_i^pro  (用户SID↔物品去偏CF) │   │
+│  │    ② Dual U2I: c_u^int ↔ z_i  (用户去偏CF↔物品SID) │   │
+│  │    ③ Dual U2U: z_u ↔ c_u^int  (batch内用户侧)     │   │
+│  │    ④ Dual I2I: z_i ↔ c_i^pro  (batch内物品侧)     │   │
+│  │    ⑤ Dual Co-occur U2U: 共现用户SID互对齐          │   │
+│  │    ⑥ Dual Co-occur I2I: 共现物品SID互对齐          │   │
+│  └──────────────────────────────────────────────────┘   │
+│                                                          │
+│  总损失: L_All = L_Sem + α·L_CF + β·L_Align             │
+│    L_Sem: 重构+RQ-VAE码本+承诺损失                       │
+│    L_CF:  有偏+无偏CF损失+去偏正交约束                    │
+│    L_Align: 六路对比对齐损失之和                          │
+│    α=1, β=0.5                                            │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**对齐损失**：
+**CF去偏模块（ICDM）的关键创新**：
 
-$$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i}} + \mathcal{L}_{\text{co-occur}}$$
+原始CF信号包含流行度偏差（热门物品获得更多交互）和从众偏差（用户倾向跟随大众行为）。如果直接用原始CF信号对齐，SID会被这些偏差污染。ICDM将CF表示分解为**无偏分量**和**偏差分量**，对齐时只使用无偏分量（$c_u^{int}$ 和 $c_i^{pro}$）。
 
-**关键创新**：
-- **一阶段训练**：端到端联合训练CF模型和SID量化模型，量化和对齐同时优化，避免两阶段方法的信息损失
-- **灵活性**：兼容各种量化方法（RQ-VAE、Res-KMeans等）和CF方法
+**关键特点**：
+- **一阶段训练**：量化、CF建模、对齐三者端到端联合优化，避免两阶段信息损失
+- **去偏对齐**：唯一显式对CF信号去偏的SID对齐方法
+- **灵活性**：兼容各种量化方法（RQ-VAE、Res-KMeans等）
 - 已在快手广告系统部署，服务4亿日活用户
+
+### 7.4 PLUM SID-v2：共现对比对齐
+
+- **论文**：[PLUM: Adapting Pre-trained Language Models for Industrial-scale Generative Recommendations](https://arxiv.org/abs/2510.07784)
+- **对齐时机**：**Joint alignment**（共现对比损失作为RQ-VAE训练的一部分）
+
+**对齐方法**：在RQ-VAE训练损失中添加共现对比损失（Co-occurrence Contrastive Loss）
+
+$$\mathcal{L}_{\text{SID-v2}} = \mathcal{L}_{\text{recon}} + \mathcal{L}_{\text{RQ}} + \mathcal{L}_{\text{con}}$$
+
+其中共现对比损失：
+
+$$\mathcal{L}_{\text{con}} = -\sum_{i=1}^{2N_b} \log \frac{\exp(\text{sim}(\mathbf{p}_i, \mathbf{p}_{i^+}))}{\sum_{j=1}^{2N_b} \exp(\text{sim}(\mathbf{p}_i, \mathbf{p}_j))}$$
+
+$i^+$ 表示在用户观看历史中与物品 $i$ 共现的物品。
+
+**与DAS对齐的对比**：
+- PLUM只在物品级别做共现对比，DAS有更丰富的多视角对齐（六路）
+- PLUM不对CF信号做去偏，DAS显式分离流行度/从众偏差
+- PLUM更轻量（单损失项），DAS需要独立的CF模型+去偏模块
+
+**效果**：SID唯一性从94.0%（SID-v1无对齐）提升到96.7%，Recall@10从12.3%提升到14.4%。
+
+### 7.5 MMQ：后置行为感知微调
+
+- **论文**：[MMQ: Multimodal Mixture-of-Quantization Tokenization](https://arxiv.org/abs/2508.15281)
+- **对齐时机**：**Post-alignment**（先训练内容量化器，再用推荐信号微调码本）
+
+```
+MMQ 两阶段对齐:
+
+  Stage 1: 多模态Tokenizer训练 (内容量化)
+    ├── MoE多专家量化 (模态特定Expert+共享Expert)
+    └── 输出: 基于内容的SID
+    
+  Stage 2: 行为感知微调 (对齐)
+    ├── 不冻结码本 → 推荐损失(NTP/BCE)梯度回传
+    ├── 动态调整码本聚类中心
+    │   → 行为相似的物品(即使内容不同)被映射到相近的聚类
+    └── 同时保持多模态重构损失 → 防止模态信息在对齐中丢失
+```
+
+### 7.6 UniSID：端到端联合优化
+
+- **论文**：[End-to-End Semantic ID Generation](https://arxiv.org/abs/2602.10445)
+- **对齐时机**：**End-to-end**（embedding和SID联合优化，无独立量化阶段）
+
+**对齐方法**：多粒度对比学习——在每个SID层级 $l$，构造不同粒度的正例集 $P_l$：粗粒度层用宽泛的相似性标准（同顶级类目），细粒度层用严格标准（同子类目）。
+
+### 7.7 DIGER：可微分对齐
+
+- **论文**：[Differentiable Semantic ID for Generative Recommendation](https://arxiv.org/abs/2601.19711)
+- **对齐时机**：**End-to-end**（推荐损失通过可微量化直接优化码本）
+
+**对齐方法**：Gumbel-Softmax使量化操作可微，推荐损失的梯度通过软概率传播到码本。总损失 $L = L_{gen} + L_{vq} + L_{recon}$，其中 $L_{gen}$（自回归next-SID预测）是主要驱动力。
+
+**码本坍塌缓解**：不确定性衰减策略（SDUD和FrqUD），随训练进行自动降低Gumbel噪声。
+
+**关键特点**：最彻底的对齐形式——推荐目标直接塑造码本，无需显式对齐步骤。
+
+### 7.8 无显式对齐的方法
+
+- **TIGER**：纯内容RQ-VAE量化，无对齐
+- **OneRec**：RQ-KMeans纯内容量化+多级别衡，无CF信号注入。OneRec的"Itemic-Text Alignment"（Stage 1预训练）是SID-to-LLM语言空间的对齐（让SID token在LLM词表中找到正确位置），**不是**内容-to-CF的对齐
+
+这些方法依赖后续预训练阶段（行为序列的NTP训练）隐式学习协同信号。
+
+### 7.9 对齐方法对比总结
+
+| 维度 | QARM | DAS | PLUM SID-v2 | MMQ | UniSID | DIGER |
+|------|------|-----|-------------|-----|--------|-------|
+| **对齐时机** | Pre | Joint | Joint | Post | E2E | E2E |
+| **对齐复杂度** | 中 | 高 | 低 | 中 | 高 | 高 |
+| **CF去偏** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **对齐信号来源** | 业务物品对 | CF模型+交互 | 用户共现序列 | 推荐loss梯度 | 多粒度对比 | 推荐loss梯度 |
+| **是否需独立CF模型** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **码本是否动态调整** | ❌ | ❌ | ❌ | ✅ | N/A | ✅ |
+
+**演进趋势**：从两阶段分离（无对齐/Pre-alignment）走向端到端联合优化（DIGER/UniSID），使SID天然包含协同过滤信号。
 
 ---
 
@@ -1162,18 +1369,44 @@ $$\mathcal{L}_{\text{align}} = \mathcal{L}_{\text{u2i}} + \mathcal{L}_{\text{i2i
 - **端到端语义ID生成**（UniSID）：SID构造与推荐模型联合优化
 - **LLM适配生成式推荐**（PLUM）：离线SID构造 + 预训练LLM适配（SID生成本身是离线的，但整体框架将SID纳入LLM词表进行端到端预训练）
 
-### 9.1 UniSID：广告推荐端到端生成
+### 9.1 腾讯UniSID：广告推荐端到端生成
 
 - **标题**：[End-to-End Semantic ID Generation for Generative Advertisement Recommendation](https://arxiv.org/abs/2602.10445)
+- **机构**：腾讯 + 武汉大学
 - **发表**：arXiv 2026年2月
 - **使用范式**：**LLM4GRs**
 - **构造范式**：**端到端**（联合优化embedding和语义ID）
 
 **核心创新**：
-- **端到端优化**：embedding和语义ID联合学习
+- **端到端优化**：embedding和语义ID联合学习（取代传统两阶段：先训RQ-VAE tokenizer，再训推荐模型）
 - **多粒度对比学习**：在不同SID层级对齐不同粒度的语义
 - **广告增强输入模式**：将异构广告信号线性化为统一token序列
 - **摘要式广告重构**：鼓励SID捕获高层语义
+
+**关于"端到端"的重要澄清**：
+
+UniSID的"端到端"指的是**embedding生成和SID生成的端到端联合优化**（从原始广告数据同时产出embedding+SID），**并非**从tokenizer一直到最终推荐的全链路端到端。具体来说：
+
+```
+UniSID的"端到端"范围:
+  原始广告数据 (指令/图片/文本/属性)
+    ↓ MLLM (Qwen2.5-VL-3B)
+    ↓ 双投影头
+  ┌─────────────────────────┐
+  │ SID生成 + Embedding生成  │  ← 这部分是联合优化的
+  └─────────────────────────┘
+    ↓                           ↓
+  SID tokens              Embeddings
+    ↓                           ↓
+  ┌──────────────────────────────────────────┐
+  │    下游推荐模型 (如TIGER框架)              │  ← 仍需独立的下游模型
+  │    用SID+embedding作为输入做生成式推荐     │
+  └──────────────────────────────────────────┘
+```
+
+UniSID本身是一个**tokenizer/embedding生成框架**，不是完整的推荐系统。论文中明确提到"integrate UniSID into the TIGER framework by replacing its original RQ-VAE SID generation module"。
+
+与DIGER的对比：DIGER通过可微量化让推荐梯度直接回传到码本，实现从tokenizer到推荐的真正端到端；UniSID则只是消除了embedding和SID之间的两阶段分离，但SID产出后仍需下游推荐模型使用。
 
 **效果**：Hit Rate比最强baseline提升4.62%。
 
@@ -1300,7 +1533,46 @@ PLUM 整体流程:
 
 **YouTube Shorts实验**：Panel CTR +4.96%。
 
----
+### 9.3 DIGER：可微分语义ID端到端联合优化
+
+- **标题**：[Differentiable Semantic ID for Generative Recommendation](https://arxiv.org/abs/2601.19711)
+- **发表**：SIGIR 2026
+- **使用范式**：**LLM4GRs**
+- **构造范式**：**端到端**（可微分量化，推荐梯度直接优化码本）
+
+> **与UniSID的区别**：UniSID的"端到端"是embedding和SID的联合生成，SID产出后仍需下游推荐模型；DIGER通过可微量化让推荐梯度直接回传到码本，实现从量化器到推荐模型的真正端到端优化。
+
+**核心问题**：传统两阶段方法中，SID是冻结的，推荐模型的梯度无法回传到量化器，导致**目标不一致**——SID为内容重构优化，推荐模型为next-item prediction优化，两者从未协调。
+
+**解决方案**：Gumbel-Softmax可微分量化
+
+```
+DIGER 端到端架构:
+
+  前向传播 (硬分配, 产出离散SID):
+    logits_l = sim(r_{l-1}, codebook_l)      ← 残差与码本的相似度
+    g ~ Gumbel(0, 1)                          ← Gumbel噪声
+    c_l = argmax(logits_l + g)                ← 离散SID token
+    
+  反向传播 (软更新, 梯度流到码本):
+    y_soft = softmax((logits + g) / τ)        ← 软概率
+    ē = Σ y_soft_i · e_i                      ← 加权码本embedding
+    → 推荐损失梯度通过y_soft传播到码本参数
+
+  总损失: L = L_gen + L_vq + L_recon
+    L_gen: 自回归next-SID预测 (主要驱动力, 推荐目标)
+    L_vq:  RQ-VAE量化损失 (稳定码本)
+    L_recon: 重构损失 (保持内容语义)
+```
+
+**码本坍塌缓解**——不确定性衰减策略：
+- **SDUD**（标准差衰减）：随 $L_{gen}$ 降低，Gumbel噪声尺度自动缩小，从探索过渡到利用
+- **FrqUD**（频率衰减）：仅对高频码字施加噪声，低频码字做确定性分配
+
+**关键特点**：
+- 最彻底的对齐形式——推荐目标直接塑造码本，无需显式对齐步骤
+- 固定 $\tau=2.0$（不做温度退火），因为SID在推理时必须离散
+- Recall@10比两阶段baseline提升13.4%（Amazon Beauty数据集）
 
 ## 10. 工业基准
 
@@ -1319,7 +1591,7 @@ PLUM 整体流程:
 
 ---
 
-## 11. 多模态语义ID构造专题
+## 11. 多模态语义ID构造
 
 ### 11.1 问题背景
 
@@ -1358,7 +1630,7 @@ semantic_id = rq_vae(concat_emb)   # shape: [B, L]
 
 ### 11.3 MMQ：阿里MoE混合量化（WWW 2025）
 
-- **标题**：[MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation](https://arxiv.org/abs/2502.16077)
+- **标题**：[MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation](https://arxiv.org/abs/2508.15281)
 - **机构**：阿里巴巴
 - **发表**：WSDM 2026 / arXiv 2025年2月
 - **使用范式**：**LLM4GRs**
@@ -1561,7 +1833,7 @@ $$\mathcal{L}_{\text{MMQ}} = \mathcal{L}_{\text{quant}} + \lambda_1 \mathcal{L}_
 
 16. COBRA Team, Baidu. (2025). Unified Generative Recommendations with Cascaded Sparse-Dense Representations. arXiv:2503.02453. https://arxiv.org/abs/2503.02453
 
-17. Xu, et al. (2025). MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation. *WSDM 2026*. arXiv:2502.16077. https://arxiv.org/abs/2502.16077
+17. Xu, et al. (2025). MMQ: Multimodal Mixture-of-Quantization Tokenization for Semantic ID Generation and User Behavioral Adaptation. *WSDM 2026*. arXiv:2508.15281. https://arxiv.org/abs/2508.15281
 
 18. MACRec Team. (2025). Multi-Aspect Cross-modal Quantization for Generative Recommendation. arXiv:2511.15122. https://arxiv.org/abs/2511.15122
 

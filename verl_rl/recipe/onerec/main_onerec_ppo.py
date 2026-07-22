@@ -12,7 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-OneRec custom main entry point for PPO training using custom onerec_ray_trainer.
+OneRec PPO/GRPO 训练入口
+========================
+
+本文件是 OneRec RL 训练的主入口，通过 Hydra 管理配置。
+
+启动方式:
+  python -m recipe.onerec.main_onerec_ppo [hydra overrides]
+  或通过 run_grpo.sh 脚本启动 (推荐)
+
+主要流程:
+  1. Ray 初始化 (分布式集群)
+  2. 加载 tokenizer / processor
+  3. 创建 Worker (Actor + Reference, 可选 Critic + RewardModel)
+  4. 加载训练/验证数据集
+  5. 创建 RayPPOTrainer 并启动训练
+
+与标准 verl 训练的区别:
+  - 使用自定义 RayPPOTrainer (from onerec_ray_trainer.py)
+  - 使用自定义 OneRecActorRolloutRefWorker (两阶段 rollout)
+  - 使用自定义 OneRecDataset + compute_score (推荐 reward)
 """
 
 import os
@@ -220,9 +239,13 @@ class OneRecTaskRunner:
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        # ========================================================================
-        # KEY CHANGE: Use the custom OneRec RayPPOTrainer instead of default
-        # ========================================================================
+        # ====================================================================
+        # 核心改动: 使用自定义的 OneRec RayPPOTrainer
+        # ====================================================================
+        # 标准 verl 使用 verl.trainer.ppo.ray_trainer.RayPPOTrainer
+        # OneRec 使用 recipe.onerec.onerec_ray_trainer.RayPPOTrainer
+        # 区别: 自定义 trainer 支持两阶段 rollout、beam search 扩展、
+        #       UID 分组、per-data-source 指标记录等 OneRec 特有逻辑
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,

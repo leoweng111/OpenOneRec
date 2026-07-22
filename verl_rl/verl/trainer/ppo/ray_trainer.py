@@ -68,6 +68,15 @@ WorkerType = type[Worker]
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
+
+    角色枚举 — 定义分布式训练中各类 Worker 的职责:
+      Actor:         策略模型 (生成推荐序列)
+      Rollout:       推理引擎 (vLLM, 用于生成候选)
+      ActorRollout:  Actor + Rollout 合二为一 (混合引擎, OneRec 默认)
+      Critic:        价值函数 (仅 PPO/GAE 需要, GRPO 不需要)
+      RefPolicy:     参考策略 (冻结的旧模型, 用于 KL 正则)
+      RewardModel:   奖励模型 (神经网络打分, 可选)
+      ActorRolloutRef: Actor + Rollout + Ref 三者合一
     """
 
     Actor = 0
@@ -298,6 +307,25 @@ class RayPPOTrainer:
     This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
     managing actor rollouts, critic training, and reward computation with Ray backend.
     Supports various model architectures including FSDP, Megatron, and vLLM integration.
+
+    分布式 PPO/GRPO 训练器 (Ray 单控制器架构):
+
+    核心职责:
+      1. 管理分布式 Worker (Actor, Rollout, Critic, Reference 等)
+      2. 编排训练流程: Rollout → Reward → 优势估计 → 策略更新
+      3. 在驱动进程 (driver) 上运行，通过 RPC 调用各 Worker
+
+    训练流程 (每步):
+      gen_batch → actor_rollout_wg.generate_sequences()  (生成候选)
+                → compute_reward()                        (计算reward)
+                → compute_log_prob()                      (旧策略log概率)
+                → compute_ref_log_prob()                  (参考策略log概率)
+                → compute_advantage()                     (GRPO/GAE优势估计)
+                → update_actor()                          (PPO-clip策略梯度更新)
+
+    模型数量 (取决于算法):
+      PPO:  Actor + Rollout + Critic + Reference = 4个模型
+      GRPO: Actor + Rollout + Reference = 2~3个模型 (不需要Critic)
     """
 
     # TODO: support each role have individual ray_worker_group_cls,
@@ -339,6 +367,7 @@ class RayPPOTrainer:
         """
 
         # Store the tokenizer for text processing
+        # 保存 tokenizer 和 processor，用于文本编解码和多模态数据处理
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
@@ -363,6 +392,7 @@ class RayPPOTrainer:
         )
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
+        # 如果使用 LoRA，参考策略就是 Actor 去掉 LoRA 权重 (节省一份模型内存)
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
 
         # define in-reward KL control
@@ -370,6 +400,10 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        # 根据优势估计算法决定是否需要 Critic 网络:
+        # GAE (PPO): 需要 Critic 估计 V(s) → 4个模型 (Actor+Rollout+Critic+Ref)
+        # GRPO/REINFORCE++/REMAX/RLOO/OPO/GPG: 不需要 Critic → 2~3个模型
+        # OneRec 默认使用 GRPO，所以 use_critic = False
         if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
@@ -839,12 +873,27 @@ class RayPPOTrainer:
         Creates:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
+
+        初始化分布式训练 Worker:
+
+        步骤:
+          1. 创建 Ray 资源池 (GPU 资源分配)
+          2. 根据 role_worker_mapping 创建各类 Worker:
+             - ActorRollout: 策略模型 + 推理引擎 (必须)
+             - Critic:       价值函数 (仅 PPO/GAE 需要)
+             - RefPolicy:    参考策略 (KL 正则需要)
+             - RewardModel:  奖励模型 (可选)
+          3. 将多个 Worker 共置 (colocate) 到同一组 GPU 上 (节省资源)
+          4. 初始化各 Worker 的模型权重
+
+        注意: Actor/Rollout 最后初始化，让 vLLM 能更准确估计 KV Cache 显存
         """
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
+        # 创建 Actor + Rollout (混合引擎: 训练和推理共享模型权重)
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
             actor_rollout_cls = RayClassWithInitArgs(
@@ -882,6 +931,8 @@ class RayPPOTrainer:
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
         # initialize WorkerGroup
+        # 将多个 Worker 共置 (colocate) 到同一资源池上
+        # 例如: Actor + Rollout + Ref 可以共享同一组 GPU (通过 FSDP 分片)
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
         # Instead, directly pass different resource pool to different worker groups.
@@ -910,6 +961,8 @@ class RayPPOTrainer:
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
 
+        # 初始化各 Worker 的模型权重 (加载 checkpoint、构建推理引擎等)
+        # Critic 和 RefPolicy 先初始化，Actor/Rollout 最后初始化
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
             self.critic_wg.init_model()
@@ -1097,6 +1150,20 @@ class RayPPOTrainer:
         The driver process only need to call the compute functions of the worker group through RPC
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
+
+        RL 训练主循环 (PPO/GRPO):
+
+        每步训练流程:
+          ①  Rollout:     actor_rollout_wg.generate_sequences()  → 生成候选序列
+          ②  Reward:      compute_reward()                       → 计算每条候选的 reward
+          ③  Old LogProb: actor_rollout_wg.compute_log_prob()    → 当前策略的 log 概率
+          ④  Ref LogProb: ref_policy_wg.compute_ref_log_prob()   → 参考策略的 log 概率 (KL 正则用)
+          ⑤  Values:      critic_wg.compute_values()             → Critic 估计 V(s) (仅 PPO)
+          ⑥  Advantage:   compute_advantage()                    → GRPO 组内标准化 / GAE 时序差分
+          ⑦  Update:      update_actor() / update_critic()       → 策略梯度更新
+          ⑧  Metrics:     记录 reward、loss、entropy 等指标
+
+        驱动进程 (driver) 通过 RPC 调用各 Worker，自身只做轻量的优势计算。
         """
         from omegaconf import OmegaConf
 
@@ -1112,6 +1179,7 @@ class RayPPOTrainer:
         self.global_steps = 0
 
         # load checkpoint before doing anything
+        # 从磁盘加载 SFT checkpoint 作为 RL 的初始策略
         self._load_checkpoint()
 
         # perform validation before training
@@ -1148,6 +1216,8 @@ class RayPPOTrainer:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
+                # 从 batch 中分离出"生成所需"的字段 (prompt tokens) 和"非 tensor"字段
+                # 生成阶段只需要 prompt，不需要 ground_truth 等其他信息
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                 if "multi_modal_data" in batch.non_tensor_batch:
@@ -1175,7 +1245,9 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # ① Rollout: 用当前策略模型生成候选序列
+                    # OneRec 使用两阶段生成: CoT 采样 → Beam Search
+                    # 输出从 [B] 扩展到 [B × rollout_n] (beam search 扩展)
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -1202,6 +1274,9 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
+                    # 为每条 prompt 生成唯一 UID
+                    # 同一 prompt 的多条候选 (beam search 结果) 共享同一 UID
+                    # → GRPO 优势估计时按 UID 分组，组内标准化
                     batch.non_tensor_batch["uid"] = np.array(
                         [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                     )
@@ -1222,8 +1297,12 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    # ② Reward: 计算每条候选的奖励分数
+                    # 可以有两种来源:
+                    #   - Reward Model (神经网络打分): rm_wg.compute_rm_score()
+                    #   - Rule-based Reward (规则函数): reward_fn (如 compute_score)
+                    # OneRec 使用 rule-based reward (pass@1, partial_hit 等)
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
@@ -1234,6 +1313,8 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
+                    # ③ Old LogProb: 用 rollout 时的模型快照计算每条候选的 log 概率
+                    # 这个"旧"策略用于 PPO 的概率比 ρ = π_new / π_old
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
@@ -1311,6 +1392,8 @@ class RayPPOTrainer:
                                 }
                             )
 
+                    # ④ Ref LogProb: 计算参考策略 (冻结的旧模型) 的 log 概率
+                    # 用于 KL 正则: KL(π_new || π_ref) 防止策略偏移过大
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
@@ -1326,6 +1409,9 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
+                    # ⑥ Advantage: 计算优势值 (在 driver 进程上执行，轻量计算)
+                    # GRPO: 按 UID 分组 → 组内 (reward - mean) / std → 优势值
+                    # GAE:  用 Critic 的 V(s) 做时序差分 → 优势值
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -1371,6 +1457,8 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
+                    # ⑦ 更新 Critic (仅 PPO/GAE 需要)
+                    # 用 advantage 信号训练价值函数 V(s)
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -1379,13 +1467,21 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
+                    # Critic warmup: 先训几步 Critic 再训 Actor (避免 Actor 被不稳定的 Critic 误导)
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # ⑦ 更新 Actor (策略梯度)
+                        # PPO-clip loss: L = -min(ρ·A, clip(ρ, 1-ε, 1+ε)·A) + β·KL
+                        # GRPO: 优势值来自组内标准化，不需要 Critic
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    # ⑧ Metrics & Logging: 收集并记录训练指标
+                    # 包括: reward 统计、策略 entropy、loss、throughput 等
+                    # 可选: dump rollout 生成结果、验证集评测、保存 checkpoint
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

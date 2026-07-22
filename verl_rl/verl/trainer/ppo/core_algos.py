@@ -241,7 +241,21 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
-# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+# ============================================================================
+# GRPO 优势估计 (Group Relative Policy Optimization)
+# ============================================================================
+# 核心思想: 不需要 Critic 网络，用同一 prompt 的多条候选互相比较。
+#
+# 流程:
+#   1. 每个 prompt 生成 G 条候选 (beam search, G=beam_width=32)
+#   2. 每条候选获得一个 outcome reward (如 pass@1)
+#   3. 按 prompt UID 分组，组内计算均值 μ 和标准差 σ
+#   4. 优势值 A_i = (reward_i - μ) / (σ + ε)
+#   5. 正优势的候选被鼓励，负优势的候选被抑制
+#
+# 与 PPO/GAE 的区别:
+#   PPO/GAE: 需要 Critic 网络估计 V(s) → 4个模型
+#   GRPO:    用组内均值替代 V(s) → 只需 2个模型 (Actor + Reference)
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -279,8 +293,10 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
+    # Step 1: 将 token 级 reward 求和得到每条候选的总 reward (outcome reward)
     scores = token_level_rewards.sum(dim=-1)
 
+    # Step 2: 按 UID (index) 分组，同一 prompt 的多条候选分到同一组
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
@@ -289,8 +305,11 @@ def compute_grpo_outcome_advantage(
         bsz = scores.shape[0]
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
+
+        # Step 3: 计算每组的均值和标准差
         for idx in id2score:
             if len(id2score[idx]) == 1:
+                # 只有一条候选时，无法标准化，设均值为0、标准差为1
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
@@ -298,11 +317,17 @@ def compute_grpo_outcome_advantage(
                 id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
+
+        # Step 4: 标准化优势值 A_i = (score_i - mean) / (std + ε)
+        # norm_adv_by_std_in_grpo=True 时除以标准差 (原始 GRPO)
+        # norm_adv_by_std_in_grpo=False 时只减均值 (Dr.GRPO 变体)
         for i in range(bsz):
             if norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+
+        # Step 5: 扩展到 token 维度，乘以 response_mask 屏蔽 padding
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores

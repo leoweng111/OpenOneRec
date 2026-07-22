@@ -1,4 +1,4 @@
-# 生成式推荐（Generative Recommendation）调研总结
+# 生成式推荐（Generative Recommendation）调研
 
 > 本文是生成式推荐领域的调研总结，涵盖概述、样本组织、语义ID、预训练、后训练五大主题。
 > 详细论文解读和技术细节请参见各专题文档：
@@ -23,7 +23,7 @@
   - [3.2 量化方法分类](#32-量化方法分类)
   - [3.3 串行vs并行vs混合](#33-串行vs并行vs混合)
   - [3.4 多模态语义ID](#34-多模态语义id)
-  - [3.5 协同信号注入](#35-协同信号注入)
+  - [3.5 语义ID对齐（Alignment）](#35-语义id对齐alignment)
   - [3.6 端到端优化与LLM适配](#36-端到端优化与llm适配)
 - [4. 预训练](#4-预训练)
   - [4.1 架构选择](#41-架构选择)
@@ -67,7 +67,7 @@
 
 **LLM4DLRMs（LLM赋能的深度推荐模型）**：保持判别式推荐的任务定义（对候选item打分排序），但在模型架构或特征表示上借鉴LLM的技术。这一范式内部又可分为两个发展阶段：
 
-- **阶段一：语义ID作为输入特征**——在传统DLRM架构中用语义ID替换随机Item ID，模型主体仍为DNN/DLRM。代表工作包括QARM、YouTube Semantic IDs、SIDE、DAS等。
+- **阶段一：语义ID作为输入特征**——在传统DLRM架构中用语义ID替换随机Item ID，模型主体仍为DNN/DLRM。代表工作包括快手QARM、快手DAS、YouTube Semantic IDs、SIDE等。
 - **阶段二：Transformer/Decoder-like架构用于判别式排序**——直接采用Transformer（特别是Decoder-like）架构作为排序模型，但输出仍为CTR/CVR预测分数而非生成的物品ID序列。这一方向的代表工作包括：
   - **RankMixer**（字节跳动, arXiv:2507.15551, 2025.7）：用Token Mixing替代标准self-attention，配合per-token FFN和Sparse MoE，扩展至10亿参数规模，部署于抖音Feed排序
   - **HyFormer**（字节跳动, arXiv:2601.12681, 2026.1）：用Query Decoding（类decoder cross-attention）统一长序列建模与特征交互，全球Token跨attend行为序列的KV表示，部署于抖音
@@ -80,7 +80,7 @@
 
 ### 1.3 完整训练管线
 
-生成式推荐的训练管线与LLM发展历程一致（Pretrain → SFT → RLHF/DPO），分为以下阶段：
+生成式推荐的训练管线与LLM发展历程一致（Pretrain → SFT → RLHF/PPO/DPO），分为以下阶段：
 
 ```
 离线前置: 语义ID构造 (物品→多模态Encoder→量化→离散token)
@@ -130,7 +130,7 @@ DLRM范式下，样本组织也在经历平行变革：
 - **Request-wise / List-wise**（当前主流）：同一次请求中的多个item打包为一条样本，共享user特征（如网易云音乐Climber）
 - **Set-wise**（美团HoMer）：将粗排给精排的大量候选item（如300个）打包为一条样本，支持跨item交互（如美团HoMer）
 
-LLM4GRs和LLM4DLRMs的样本组织方式可以正交组合：存储层选Request-wise压缩，训练层选NIO避免泄漏。
+LLM4GRs和LLM4DLRMs的样本组织方式可以正交组合：存储层选Request-wise压缩，训练层选New Impression Only避免泄漏。不过这块开源GR很多都是使用User-centric的范式预训练。
 
 ### 2.3 反馈信号选择
 
@@ -150,7 +150,9 @@ LLM4GRs和LLM4DLRMs的样本组织方式可以正交组合：存储层选Request
 
 语义ID（Semantic ID）用物品的**内容特征**（文本、图像、视频等）生成紧凑的离散标识符，使语义相似的物品拥有相近的ID。
 
-核心流程：`物品多模态特征 → Encoder → 连续向量z → 量化器 → 离散码(c₁, c₂, ..., c_L)`
+核心流程：`物品多模态特征 → [对齐] → Encoder → 连续向量z → 量化器 → 离散码(c₁, c₂, ..., c_L)`
+
+语义ID构造涉及两个核心环节：**量化**（将连续向量离散化为码本索引）和**对齐**（弥合内容语义与协同过滤信号的gap，详见§3.5）。
 
 关键性质：
 - **层次性**：前面的token表示粗粒度语义，后面的token表示细粒度语义（串行生成时）
@@ -192,13 +194,28 @@ LLM4GRs和LLM4DLRMs的样本组织方式可以正交组合：存储层选Request
 
 MMQ还引入行为感知微调（Stage 2），用下游推荐信号动态调整码本聚类，弥合语义-行为gap。
 
-### 3.5 协同信号注入
+### 3.5 语义ID对齐（Alignment）
 
-传统语义ID仅基于内容特征，不包含协同过滤信号（用户-物品交互模式），导致与推荐目标不一致。解决思路：
+语义ID从内容特征量化而来，只包含**内容语义**，不包含**协同过滤信号**（用户-物品交互模式），存在**语义-行为gap**。对齐的目标是弥合这一gap，使SID同时反映内容相似性和行为相似性。
 
-- **DAS**（快手）：一阶段双对齐，通过多视角对比学习将CF信号注入SID构造
-- **PLUM SID-v2**：共现对比损失，鼓励频繁共现的物品获得相似SID
-- **MMQ Stage 2**：行为感知微调，用推荐目标动态调整码本
+对齐可在SID构造的不同时机进行，形成四种范式：
+
+| 对齐时机 | 代表论文 | 核心做法 |
+|----------|---------|---------|
+| **Pre-alignment**（量化前） | QARM | 用业务交互数据微调多模态Encoder，再量化对齐后的embedding |
+| **Joint alignment**（量化中） | DAS, PLUM SID-v2 | 对齐损失作为量化训练的一部分，联合优化 |
+| **Post-alignment**（量化后） | MMQ Stage 2 | 先完成内容量化，再用推荐梯度动态调整码本聚类 |
+| **End-to-end**（端到端） | UniSID, DIGER | 不分离量化和对齐，推荐目标直接驱动SID生成 |
+
+**DAS**（快手）是最完整的对齐方案：一阶段联合训练量化、CF建模和对齐三者。核心创新是CF去偏模块（ICDM），将CF信号分解为无偏兴趣/内容和偏差分量，对齐时只用无偏分量，防止流行度偏差污染SID。采用六路多视角对比对齐（用户-物品、物品-物品、用户-用户、共现等）。
+
+**PLUM SID-v2** 采用最轻量的对齐：在RQ-VAE训练中添加共现对比损失（InfoNCE on 用户观看历史中的共现物品对），单损失项即可将SID唯一性从94.0%提升到96.7%。
+
+**DIGER** 代表最彻底的对齐形式：通过Gumbel-Softmax使量化操作可微，推荐损失梯度直接传播到码本，无需显式对齐步骤。
+
+**OneRec、TIGER**等方法不做显式对齐，SID纯基于内容量化，协同信号在后续预训练阶段（行为序列NTP训练）隐式学习。
+
+**演进趋势**：从无对齐 → Pre-alignment → Joint alignment → End-to-end，逐步走向联合优化。
 
 ### 3.6 端到端优化与LLM适配
 
@@ -409,7 +426,7 @@ Reward模型将用户多维反馈量化为标量信号，是后训练的核心�
 13. OneSearch — OneSearch Team, Kuaishou. (2025). OneSearch. arXiv:2509.03236
 14. COBRA — COBRA Team, Baidu. (2025). Unified Generative Recommendations with Cascaded Sparse-Dense Representations. arXiv:2503.02453
 15. UniSID — Jiang et al. (2026). End-to-End Semantic ID Generation. arXiv:2602.10445
-16. MMQ — MMQ Team. (2025). MMQ: Multimodal Mixture-of-Quantization Tokenization. *WSDM 2026*. arXiv:2502.16077
+16. MMQ — MMQ Team. (2025). MMQ: Multimodal Mixture-of-Quantization Tokenization. *WSDM 2026*. arXiv:2508.15281
 17. DIGER — DIGER Team. (2026). Differentiable Semantic ID for Generative Recommendation. *SIGIR 2026*. arXiv:2601.19711
 18. FORGE — FORGE Team, Alibaba. (2025). FORGE: Forming Semantic Identifiers for Generative Retrieval. arXiv:2509.20904
 19. DPO — Rafailov et al. (2023). Direct Preference Optimization. *NeurIPS 2023*. arXiv:2305.18284
