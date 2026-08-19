@@ -164,6 +164,33 @@ $$
 P_s(\pi) = \prod_{t=1}^{n} \frac{\varphi(s_{\pi(t)})}{\sum_{j=t}^{n} \varphi(s_{\pi(j)})}
 $$
 
+**符号解读**（把每个符号拆开，避免混淆）：
+
+- $\pi$：一个**排列（permutation）**，即把 $n$ 个候选排成一个有序序列。例如 $\pi=(2,3,1)$ 表示"第 1 位是 2 号物品，第 2 位是 3 号物品，第 3 位是 1 号物品"。
+- $\pi(t)$：排列 $\pi$ 中**第 $t$ 位上的物品编号（identity）**，**不是分数**。$\pi(1)$ 是排在第 1 位的物品，$\pi(2)$ 是排在第 2 位的物品，以此类推；$\pi$ 是 $\{1,\dots,n\}$ 的一个排列，所以 $\pi(t)$ 取遍 $1\sim n$ 每个值恰好一次。
+- $s_{\pi(t)}$：**第 $t$ 位那个物品的打分**，即模型给物品 $\pi(t)$ 的打分。若物品 $i$ 的打分记为 $s_i$，那么 $s_{\pi(t)}$ 就是"先取位置 $t$ 上的物品编号 $\pi(t)$，再查它的分数"。与①中的 $\hat{s}$ 是同一个东西（论文记作 $s$）。
+
+**逐位拆开看**（$n=3$ 的完整例子）：
+
+设 3 个物品 doc1 / doc2 / doc3，打分 $s=(1.0,\,0.5,\,0.2)$，取排列 $\pi=(2,3,1)$（即 doc2 排第 1、doc3 排第 2、doc1 排第 3）：
+
+| $t$ | $\pi(t)$ | $s_{\pi(t)}$ | 分子 $\varphi(s_{\pi(t)})$ | 分母 $\sum_{j=t}^{3}\varphi(s_{\pi(j)})$（=剩余物品） |
+|-----|----------|--------------|---------------------------|------------------------------------------------------|
+| 1 | 2 | $s_2 = 0.5$ | $\varphi(0.5)$ | $\varphi(0.5)+\varphi(0.2)+\varphi(1.0)$（doc2, doc3, doc1） |
+| 2 | 3 | $s_3 = 0.2$ | $\varphi(0.2)$ | $\varphi(0.2)+\varphi(1.0)$（doc3, doc1） |
+| 3 | 1 | $s_1 = 1.0$ | $\varphi(1.0)$ | $\varphi(1.0)$（doc1） |
+
+于是：
+
+$$
+P_s(\pi)
+= \frac{\varphi(0.5)}{\varphi(0.5)+\varphi(0.2)+\varphi(1.0)}
+  \times \frac{\varphi(0.2)}{\varphi(0.2)+\varphi(1.0)}
+  \times \frac{\varphi(1.0)}{\varphi(1.0)}
+$$
+
+**关键点**：每一步的分母**只包含"还没被取走"的物品**（即位置 $t, t{+}1, \dots, n$ 上的物品），已经排在前面的物品不再参与竞争。这就是 Plackett-Luce 逐步抽选的本质——第 1 步从全部 $n$ 个里选，第 2 步从剩下 $n-1$ 个里选，……，最后一步只剩 1 个，概率恒为 1。
+
 其中 $\varphi(x) > 0$ 是递增的"分值变换函数"。直观理解：第 $t$ 步从剩余候选中"选中 $\pi(t)$"的概率正比于它的 $\varphi(\text{分值})$，分母是剩余所有候选的 $\varphi(\text{分值})$ 之和；整条排列的概率是 $n$ 步的乘积。
 
 论文给出两种常用 $\varphi$：
@@ -251,13 +278,333 @@ $$
 L = - \log P_{\hat{s}}(\text{正样本}) = - \log \mathrm{softmax}\bigl(\hat{s}_{\text{正样本}}\bigr)
 $$
 
+**逐步推导（为什么 one-hot 会让交叉熵"塌缩"成只剩正样本那一项）**
+
+回到 ④ 的交叉熵（一个 query 有 $n$ 个候选，$P_{\hat{s}}(i)$ 是模型给 item $i$ 的 softmax 概率）：
+
+$$
+L(\hat{s}, y) = -\sum_{i=1}^{n} P_y(i)\, \log P_{\hat{s}}(i)
+$$
+
+"one-hot 标签"的含义是：把标签分布 $P_y$ 直接定义成"正样本概率为 1、其余为 0"的确定性分布。设正样本是第 $p$ 个 item：
+
+$$
+P_y(i) = \begin{cases} 1 & i = p \\[2pt] 0 & i \neq p \end{cases}
+$$
+
+把它代进求和，逐项写开：
+
+$$
+L = -\Bigl[\, \underbrace{P_y(1)}_{=\,0}\log P_{\hat{s}}(1) + \cdots + \underbrace{P_y(p)}_{=\,1}\log P_{\hat{s}}(p) + \cdots + \underbrace{P_y(n)}_{=\,0}\log P_{\hat{s}}(n) \Bigr]
+$$
+
+凡是 $i \neq p$ 的项，系数 $P_y(i) = 0$，整项直接消失（$0 \times \log(\cdot) = 0$）；只有 $i = p$ 那一项留下来：
+
+$$
+L = -\,1 \cdot \log P_{\hat{s}}(p) = -\log P_{\hat{s}}(p)
+$$
+
+而 $P_{\hat{s}}(p)$ 就是模型对正样本的 softmax 概率：
+
+$$
+P_{\hat{s}}(p) = \frac{e^{\hat{s}_p}}{\sum_{j=1}^{n} e^{\hat{s}_j}} = \mathrm{softmax}\bigl(\hat{s}\bigr)_p
+$$
+
+所以最终：
+
+$$
+L = -\log \mathrm{softmax}\bigl(\hat{s}\bigr)_p = -\log \frac{e^{\hat{s}_p}}{\sum_{j=1}^{n} e^{\hat{s}_j}}
+$$
+
+**直观理解**：交叉熵度量"目标分布 vs 预测分布"的差异。目标分布是"正样本概率 = 1"的确定性分布，因此最小化损失就等价于**让模型把概率尽量集中到正样本上**——即最大化正样本的 softmax 概率，也就是最小化它的负对数。这就是"对正样本位置做交叉熵"。
+
+**数值例子**（沿用 ⑤：$n=3$，打分 $\hat{s}=(1.0,0.5,0.2)$，正样本是 doc1）：
+
+$$
+P_{\hat{s}}(1) = \frac{e^{1.0}}{e^{1.0}+e^{0.5}+e^{0.2}} = \frac{2.718}{5.588} = 0.486
+$$
+
+$$
+L_{\text{one-hot}} = -\ln 0.486 = 0.721
+$$
+
+对比 ⑤ 里"非 one-hot"的标签 softmax 版本（$P_y=(0.665,0.245,0.090)$）算出的 $L=0.915$——两个损失方向一致（都要求 doc1 概率高），但 one-hot 版数值不同，因为它完全忽略了负样本的标签分布。
+
+**两点澄清（容易踩的坑）**：
+
+1. **one-hot 版只"管"正样本**：负样本项系数为 0，既不贡献损失也不贡献梯度。所以它强制正样本"排第一"，但对负样本之间的相对顺序没有任何约束——这与完整 ListMLE（会约束整条排列）不同。
+2. **one-hot 与"论文原始 $P_y$"的差别**：论文的 $P_y$ 是把标签 $y$ 做 softmax（$P_y(i)=e^{y_i}/\sum_j e^{y_j}$）。若 $y_p=1$、其余为 0，则 $P_y(p)=e/(e+n-1)$，不是精确的 1，其余负样本也有 $\frac{1}{e+n-1}$ 的小权重。one-hot 是把 $P_y$ 直接设为 $\delta_{i,p}$ 的简化，也是多分类里标准的 hard-label 交叉熵。两者在"单正样本"场景方向一致、数值略有差别，工业实现常用 one-hot。
+
 这正是你同事说的做法——"query 内候选打分做 softmax，再对正样本位置做交叉熵"。**它是 ListNet top-one 损失在 one-hot 标签下的特例**，也是工业界最常见的 listwise 简化实现。原论文本身用的 P_y 是"标签的 softmax"（非 one-hot），但在"单正样本 + 其余为 0"的设定下两者非常接近（`exp(1) vs exp(0)=1`，权重 2.72:1），one-hot 是常用简化。
+
+**深入追问：你说的"对 0/1 标签做 softmax"（$e^{1}/(e^{0}+e^{0}+e^{1})$）为什么不行？——其实可以，它正是原论文的做法**
+
+先给结论：**你的公式完全合法，而且正是原论文（Cao et al. 2007）的做法**。one-hot 不是"唯一正确"，它只是目标分布的另一种（更激进的）选择。关键在于理解 $P_y$ 的性质。
+
+**$P_y$ 是"定义出来的目标分布"，不是"算出来的"**。ListNet 的框架是：把模型分数 $\hat{s}$ 和标签 $y$ 各自变成一个概率分布（$P_{\hat{s}}$ 和 $P_y$），再让两者互相逼近（交叉熵）。$P_y$ 怎么定义是建模者的自由，只要满足两条：① 是合法分布（求和为 1）；② 随标签单调（更相关 → 概率更高）。于是有两种自然选择：
+
+**方式 A：对标签做 softmax（你的公式，论文做法）**
+
+$$
+P_y(i) = \frac{e^{y_i}}{\sum_j e^{y_j}}
+\qquad \Rightarrow \qquad
+P_y = \Bigl(\frac{e}{e+2},\,\frac{1}{e+2},\,\frac{1}{e+2}\Bigr) \approx (0.576,\,0.212,\,0.212)
+$$
+
+**方式 B：one-hot（硬目标，工业常用）**
+
+$$
+P_y(i) = \delta_{i,\,p}
+\qquad \Rightarrow \qquad
+P_y = (1,\,0,\,0)
+$$
+
+**两者的关系：方式 A 是方式 B 的"锐化极限"**。引入锐化温度 $t$：
+
+$$
+P_y^{(t)}(i) = \frac{e^{t\,y_i}}{\sum_j e^{t\,y_j}}
+= \Bigl(\frac{e^{t}}{e^{t}+2},\,\frac{1}{e^{t}+2},\,\frac{1}{e^{t}+2}\Bigr)
+\xrightarrow{t\to\infty} (1,\,0,\,0)
+$$
+
+- $t=1$：就是你的公式（温和版，正样本目标概率只有 $e/(e+2)=0.576$）；
+- $t\to\infty$：趋近 one-hot（正样本目标概率 1）。
+
+所以 **one-hot 可以理解为"把目标分布锐化到极致"**：它宣称"正样本必须 100% 排第一"，而 softmax-of-labels 只宣称"正样本的 top-1 概率是每个负样本的 $e$ 倍"。
+
+**梯度上的实际差异**（同一个例子：$\hat{s}=(1.0,0.5,0.2)$，$P_{\hat{s}}=(0.486,0.295,0.219)$，梯度 $\partial L/\partial \hat{s}_i = P_{\hat{s}}(i)-P_y(i)$）：
+
+| item | $P_{\hat{s}}(i)$ | 方式A $P_y(i)$ | 方式A梯度 | 方式B $P_y(i)$ | 方式B梯度 |
+|------|------------------|----------------|-----------|----------------|-----------|
+| doc1（正） | 0.486 | 0.576 | $-0.090$ | 1 | $-0.514$ |
+| doc2（负） | 0.295 | 0.212 | $+0.083$ | 0 | $+0.295$ |
+| doc3（负） | 0.219 | 0.212 | $+0.007$ | 0 | $+0.219$ |
+
+解读：
+
+- **优化方向完全一致**：两种方式都让 doc1 升分、doc2/doc3 降分，排序目标相同。
+- **力度不同**：one-hot 的梯度明显更激进——正样本约 5.7 倍（$0.514/0.090$），负样本可差数十倍（如 doc3 的 $0.219/0.007 \approx 31$ 倍）。因为 one-hot "要求"负样本概率压到 0，而 softmax-of-labels 只要求压到 $1/(e+2)=0.212$ 即可。
+- **列表很长时两者趋于一致**：$n$ 很大时 $1/(e+n-1)\to 0$，方式 A 的负样本目标概率趋近 0，与方式 B 越来越接近。
+
+**那到底该用哪个？**
+
+| 场景 | 建议 | 原因 |
+|------|------|------|
+| 二值标签，只关心"正样本是否排第一" | **one-hot** | 实现即标准多分类 softmax 损失（`tf.nn.sparse_softmax_cross_entropy_with_logits`），梯度干净，工业默认 |
+| 多级相关性标签（如 NDCG 0-4 分） | **softmax-of-labels（或按标签加权的目标）** | one-hot 会丢掉"2 分比 1 分更相关"的层级信息，这正是原论文的设定场景 |
+| 二值标签但 query 内**多个正样本** | 完整 ListMLE / top-k 损失 | one-hot 需逐正样本或选主正样本处理，softmax-of-labels 给所有正样本等权重，都不理想 |
 
 **⑦ 关键性质与局限**
 
 - 复杂度：top-one 版为 **$O(n)$**，优于 pairwise RankNet 的 $O(n^2)$。
 - 与指标的关系：ListNet 损失优化的是"概率分布距离"，与 NDCG 等排序指标只是**松散相关**（论文讨论了在特殊条件如二值标签下才与 NDCG 有更强联系），不直接对齐位置折扣。
 - 局限：① 不区分"排第 1 还是第 2"（无位置折扣）；② 完整排列概率/top-k(k>1) 计算代价高，论文主要用 k=1；③ 对"多个正样本"的处理依赖标签分布的选择。
+
+**⑧ 与 baseline 的 BCE 损失对比：pointwise vs listwise（核心区别）**
+
+**baseline 的损失到底是什么**
+
+`loss_op_cr = tf.reduce_sum(tf.keras.backend.binary_crossentropy(target=labels[1], output=q[2]))`
+
+- `labels[1]` = 转化标签 $\text{cr} \in \{0,1\}$（该酒店是否被下单）；
+- `q[2]` = 模型输出的 $\text{ctcvr} = P(\text{click}) \times P(\text{convert})$；
+- `tf.reduce_sum` 把 batch 内每个 item 的损失全部加起来。
+
+其数学形式是**逐样本二分类交叉熵**：
+
+$$
+\ell_{\text{BCE}} = \sum_{i=1}^{N} -\,[\, y_i \log p_i + (1-y_i)\log(1-p_i)\,],
+\qquad p_i = q[2]_i,\ \ y_i = \text{cr}_i
+$$
+
+**关键**：虽然数据是 query-wise 组织的（一次请求的 item 在同一个 batch 块、共享 `query_id`），但这个损失对每个 item $i$ 只用到它**自己**的 $(p_i, y_i)$——同 query 的其他 item 完全不参与梯度。这就是 pointwise。
+
+作为对比，listwise 损失（ListNet top-one、one-hot 版）长这样：
+
+$$
+\ell_{\text{list}} = -\log \frac{e^{s_{\text{正}}}}{\sum_{j \in \text{query}} e^{s_j}}
+$$
+
+正样本的损失依赖**同 query 所有 item 的分数**（softmax 分母）。这就是本质区别：pointwise 看"每个 item 绝对对错"，listwise 看"正样本在列表里的相对位置"。
+
+**具体例子**（同一个 query 返回 3 个酒店 A / B / C，转化标签 $y=(1,0,0)$，只有 A 被下单）：
+
+| 情况 | logits $s=(s_A,s_B,s_C)$ | 排序 |
+|------|--------------------------|------|
+| ① 排序正确 | $(2.0,\,1.0,\,0.5)$ | A 第 1 |
+| ② 排序正确，整体平移 $-1.8$ | $(0.2,\,-0.8,\,-1.3)$ | A 第 1（与①相对序完全相同） |
+| ③ 排序错误 | $(0.5,\,1.0,\,2.0)$ | A 第 3（最后） |
+
+**情况①**（A 第 1）：
+
+$$
+p = \bigl(\sigma(2.0),\,\sigma(1.0),\,\sigma(0.5)\bigr) = (0.881,\,0.731,\,0.622)
+$$
+
+$$
+\ell_{\text{BCE}} = -\ln 0.881 - \ln(1-0.731) - \ln(1-0.622) = 0.127 + 1.313 + 0.974 = 2.414
+$$
+
+$$
+\ell_{\text{list}} = -\log\frac{e^{2.0}}{e^{2.0}+e^{1.0}+e^{0.5}} = -\log\frac{7.389}{11.756} = -\log 0.628 = 0.465
+$$
+
+**情况②**（相对序同①，但整体平移 $-1.8$）：
+
+$$
+p = \bigl(\sigma(0.2),\,\sigma(-0.8),\,\sigma(-1.3)\bigr) = (0.550,\,0.310,\,0.214)
+$$
+
+$$
+\ell_{\text{BCE}} = -\ln 0.550 - \ln(1-0.310) - \ln(1-0.214) = 0.598 + 0.371 + 0.241 = 1.210
+$$
+
+$$
+\ell_{\text{list}} = -\log\frac{e^{0.2}}{e^{0.2}+e^{-0.8}+e^{-1.3}} = -\log\frac{1.221}{1.943} = -\log 0.628 = 0.465
+$$
+
+**情况③**（A 排最后）：
+
+$$
+p = \bigl(\sigma(0.5),\,\sigma(1.0),\,\sigma(2.0)\bigr) = (0.622,\,0.731,\,0.881)
+$$
+
+$$
+\ell_{\text{BCE}} = -\ln 0.622 - \ln(1-0.731) - \ln(1-0.881) = 0.474 + 1.313 + 2.127 = 3.914
+$$
+
+$$
+\ell_{\text{list}} = -\log\frac{e^{0.5}}{e^{0.5}+e^{1.0}+e^{2.0}} = -\log\frac{1.649}{11.756} = -\log 0.140 = 1.964
+$$
+
+**结果汇总**：
+
+| 情况 | 排序 | $\ell_{\text{BCE}}$（baseline） | $\ell_{\text{list}}$（ListNet） |
+|------|------|-------------------------------|-------------------------------|
+| ① 正确 | A 第 1 | 2.414 | 0.465 |
+| ② 同序平移 | A 第 1 | **1.210（变）** | **0.465（不变）** |
+| ③ 错误 | A 第 3 | 3.914 | 1.964 |
+
+**从这个例子读出的结论**：
+
+1. **BCE 没有平移不变性**：② 与 ① 排序完全相同，但整体分数平移 $-1.8$ 后 $\ell_{\text{BCE}}$ 从 2.414 变到 1.210——损失被"绝对概率"主导，而不是"相对排序"。listwise 的 softmax 分母把所有分数归一化，所以② 与 ① 的 $\ell_{\text{list}}$ 都是 0.465。
+2. **BCE 对排序错误的惩罚是间接的**：③ 中 A 排最后，$\ell_{\text{BCE}}$ 暴涨的主因是负样本 B、C 的预测概率太高（$1-p$ 很小），而不是"正样本相对位置错"这件事被直接建模。
+3. **listwise 直接对齐排序**：$\ell_{\text{list}}$ 只看"正样本分数在所有 item 中的相对位置"，这正是 GAUC / NDCG 关心的对象。但 ListNet 无位置折扣（A 排第 1 与排第 2 对 top-one 损失一样），要完全对齐 NDCG 还需 ApproxNDCG / LambdaLoss 这类带位置折扣的损失（见 #4 / #5 / #6）。
+4. **落到代码**：把 baseline 的 $\ell_{\text{BCE}}$ 换成 listwise 损失，就是要按 `query_id` 分组、组内做 softmax 再对正样本取负对数；`tf.reduce_sum` 相应变成"每个 query 各算一个列表损失，再对 query 求平均"（实现见 §5 实验 A）。
+
+**⑨ baseline 中的 ListNet 代码实现：每一行与数学公式的对应**
+
+> 对应实验目录 `zxhtl_seq_v2_5_nosid_topnsp_qw_listnet_auxloss_meanpool_M3oE_f_idgate_300` 中 `build_model` 里的 `_build_listnet_loss`。
+
+**⑨.1 query_id 怎么来的（一次请求的所有 item 共享同一个 id）**
+
+在 `_parse_tfrd_query_wise` 中：
+
+```python
+query_id = tf.fill([self.config.parm.items_per_request], tf.cast(request_id, tf.int64))
+```
+
+- `request_id` 是 `build_dataset` 里 `tf.data.Dataset.enumerate()` 生成的递增下标：第 0 个请求 → 0、第 1 个请求 → 1、……（每步 `batch_size` 个请求、`drop_remainder=True`，所以范围恰好是 `0..batch_size-1`）。
+- `tf.fill([M], value)` 生成一个长度为 $M$、**所有元素都等于 `value`** 的张量。因此一个请求展开的 $M$ 个位置（真实 item + padding）全部拿到同一个 `request_id`。
+- `build_model` 里 flatten 成 `[BM, 1]`（request-major：全局下标 = $r \times M + i$），再经 `boolean_mask` 后，每个有效 item 仍带着自己的 query_id → 这就是 ListNet 按 query 分组的依据。
+
+示例（$batch\_size=2,\ M=3$）：
+
+$$
+\text{enumerate} \Rightarrow \text{request\_id}=0,1
+\Rightarrow
+\begin{bmatrix} 0&0&0 \\ 1&1&1 \end{bmatrix}
+\xrightarrow{\text{flatten}}
+\begin{bmatrix} 0\\0\\0\\1\\1\\1 \end{bmatrix}
+$$
+
+**⑨.2 tf.unsorted_segment_sum 的语法**
+
+```python
+tf.unsorted_segment_sum(data, segment_ids, num_segments)
+```
+
+- `data`：shape `[N, ...]`，要被分组的张量；
+- `segment_ids`：shape `[N]`，`data[i]` 属于哪一组（从 0 编号）；
+- `num_segments`：分组总数，**必须 ≥ `segment_ids` 最大值 + 1**；
+- 输出 `output[k] = Σ_{j: segment_ids[j]==k} data[j]`，shape `[num_segments] + data.shape[1:]`。
+
+名字里的 **unsorted** 表示不要求 `segment_ids` 有序（`boolean_mask` 之后 item 顺序是乱的，正好需要这个）。它是在"一维展平 + 每元素一个组 id"的形态下，把数据重新聚合成 `[num_q]` 组级向量的标准做法：
+
+| 代码 | 数学含义 |
+|------|---------|
+| `tf.unsorted_segment_max(logits, qid_1d, num_q)` | $M_q = \max_{j\in q} s_j$，每组最大 logit |
+| `tf.unsorted_segment_sum(exp_shifted, qid_1d, num_q)` | $Z_q = \sum_{j\in q} e^{\,s_j - M_q}$，每组 softmax 分母 |
+| `tf.unsorted_segment_sum(label, qid_1d, num_q)` | $k_q = \sum_{j\in q} \mathbb{1}[y_j{=}1]$，每组正样本数 |
+| `tf.unsorted_segment_sum(pos_loss, qid_1d, num_q)` | 每组正样本的损失和 |
+
+示例（7 个 item、3 个 query）：
+
+```
+qid_1d  = [0,0,0, 1,1, 2,2]
+label   = [1,0,0, 0,1, 0,0]
+pos_cnt = tf.unsorted_segment_sum(label, qid_1d, 3) = [1, 1, 0]
+```
+
+**⑨.3 数值稳定的 log-softmax（为什么先减 max）**
+
+原始 log-softmax：
+
+$$
+\log \mathrm{softmax}(s)_i = s_i - \log\Bigl(\sum_{j\in q} e^{s_j}\Bigr)
+$$
+
+问题：$e^{s_j}$ 在 $s_j \gtrsim 88$（float32）时溢出成 `inf`，损失变 NaN。利用 **softmax 平移不变性**（分子分母同乘 $e^{-M_q}$）：
+
+$$
+\frac{e^{s_i}}{\sum_j e^{s_j}}
+= \frac{e^{s_i - M_q}}{\sum_j e^{s_j - M_q}}
+\quad\Rightarrow\quad
+\log \mathrm{softmax}(s)_i
+= (s_i - M_q) - \log\Bigl(\sum_j e^{s_j - M_q}\Bigr)
+$$
+
+代码与公式逐行对应：
+
+| 代码 | 公式 |
+|------|------|
+| `max_logit = tf.unsorted_segment_max(logits, qid_1d, num_q)` | $M_q = \max_{j\in q} s_j$ |
+| `shifted = logits - tf.gather(max_logit, qid_1d)` | $t_i = s_i - M_{q(i)} \le 0$ |
+| `exp_shifted = tf.exp(shifted)` | $u_i = e^{t_i} \in (0,\,1]$，不会溢出 |
+| `denom = tf.unsorted_segment_sum(exp_shifted, qid_1d, num_q)` | $Z_q = \sum_{j\in q} e^{\,s_j - M_q}$ |
+| `log_softmax = shifted - tf.log(denom)` | $\log \mathrm{softmax}(s)_i = t_i - \log Z_{q(i)}$ |
+
+数值例子（$s=(1.0,0.5,0.2)$）：$M_q=1.0$，$t=(0,-0.5,-0.8)$，$Z=1+0.6065+0.4493=2.0558$，于是 $\log\mathrm{softmax}(s_1) = 0 - \log 2.0558 = -0.721$ ✓（与 $\log\frac{e^{1}}{e^{1}+e^{0.5}+e^{0.2}} = -0.721$ 一致）。
+
+**⑨.4 多正样本：当前实现做了什么（数学等价与梯度）**
+
+`pos_loss = -label * log_softmax` 会对 query 内**每个**正样本各算一个 `-log softmax`，再用 `pos_sum / pos_cnt` 取平均。假设 query 有 $k$ 个正样本（集合 $P$）：
+
+$$
+L_q = \frac{1}{k}\sum_{p\in P} -\log \mathrm{softmax}(s_p)
+= \frac{1}{k}\Bigl[\sum_{p\in P}\bigl(\log Z - s_p\bigr)\Bigr]
+= \log Z - \frac{1}{k}\sum_{p\in P} s_p
+$$
+
+梯度（$p$ 为正样本、$n$ 为负样本）：
+
+$$
+\frac{\partial L_q}{\partial s_p} = \mathrm{softmax}(s_p) - \frac{1}{k},
+\qquad
+\frac{\partial L_q}{\partial s_n} = \mathrm{softmax}(s_n)
+$$
+
+**含义**：每个正样本被推向"softmax 概率 $= 1/k$"，每个负样本被压向 0。收敛时**所有正样本排在所有负样本前面、正样本之间概率均分**。所以当前实现**也能处理多正样本**——它表达的目标是"正样本组 vs 负样本组"。
+
+**和 ListMLE 的区别**：
+
+| | ListNet（当前实现） | ListMLE |
+|---|---|---|
+| 正样本内部顺序 | 不指定，概率均分 | 需给定排列 $\pi^{*}$，显式学"$p_1$ 最前、$p_2$ 次之……" |
+| 负样本内部顺序 | 不约束 | 也参与逐位 softmax（取决于你构造的排列） |
+| 适用场景 | 只要"被点击/下单的都在没点过的前面"即可 | 正样本内部也要分先后（如下单 > 点击） |
+
+> 若需要正样本内部排序，也可以选 **ApproxNDCG**（按 relevance 累加、带位置折扣），比 ListMLE 更贴合酒店排序目标。
 
 ---
 
