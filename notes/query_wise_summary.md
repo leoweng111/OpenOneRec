@@ -3,6 +3,8 @@
 > 面向场景：智行酒店推荐精排模型，从 pointwise 打分向 query-wise（list-wise）建模范式演进的前期调研。
 > Baseline 模型：`zxhtl_seq_v2_5_nosid_topnsp_qw_meanpool_M3oE_f_idgate_300`
 > 本文档包含：① 业界/学术界 list-wise 精排前沿论文综述（所有链接均为真实可查的 arXiv / DOI 链接）；② 结合 baseline 代码的实际改造方式与实验设计。
+>
+> **公式渲染说明**：本文档的数学公式使用 **LaTeX（KaTeX / MathJax）** 语法（`$$...$$` 块级、`$...$` 行内）。请用支持数学渲染的 Markdown 查看器打开，例如 **Typora、Obsidian、VS Code（内置 Markdown 预览）、GitHub 网页端**。若查看器不支持，公式会退化为显示 LaTeX 源码。
 
 ---
 
@@ -148,12 +150,206 @@ score_i = f(x_i)   # x_i 只包含 item 自身特征 + 用户画像/行为序列
 - **方法**：NN 打分 → softmax 得到 top-one 概率 → 与真实标签的 softmax 分布算交叉熵；对全排列精确计算做了 top-k 近似。理论上分析了损失的 consistency、soundness、continuity。
 - **与 baseline 结合**：最朴素的 listwise 损失。可直接把 baseline 的 click 打分 `q[0]` 在请求内 softmax 后与"真实点击的 softmax 标签"算 KL——但 ListNet 假设有"排序标签"，酒店场景只有隐式点击标签，需把 0/1 点击转成列表内归一化标签（如点击者权重 1、未点击 0，再 softmax）。适合作为**对照基线损失**。
 
+##### 1.1 详细解析：ListNet 的原理、公式推导与例子
+
+**① 问题设定与记号**
+
+一个 query 有 $n$ 个候选文档（在酒店场景就是一次请求返回的候选酒店）。记模型对候选的打分为 $\hat{s} = (\hat{s}_1, \dots, \hat{s}_n)$，ground-truth 相关性标签为 $y = (y_1, \dots, y_n)$（酒店场景即 click/cr 的 0/1 标签或更细的等级）。ListNet 的核心思想是：**把"排序"看成在候选集合上定义一个概率分布**，然后让"模型打分诱导的概率分布"去逼近"标签诱导的概率分布"。
+
+**② 排列概率（permutation probability）**
+
+对任意一个排列 $\pi$（即把 $n$ 个候选排成一个有序序列），其概率定义为：
+
+$$
+P_s(\pi) = \prod_{t=1}^{n} \frac{\varphi(s_{\pi(t)})}{\sum_{j=t}^{n} \varphi(s_{\pi(j)})}
+$$
+
+其中 $\varphi(x) > 0$ 是递增的"分值变换函数"。直观理解：第 $t$ 步从剩余候选中"选中 $\pi(t)$"的概率正比于它的 $\varphi(\text{分值})$，分母是剩余所有候选的 $\varphi(\text{分值})$ 之和；整条排列的概率是 $n$ 步的乘积。
+
+论文给出两种常用 $\varphi$：
+
+| 分值函数 | 要求 | 不变性 |
+|------|------|--------|
+| 线性 $\varphi(x)=x$ | 分值需 $>0$ | **尺度不变**：整体乘以常数 $a>0$，$P$ 不变 |
+| 指数 $\varphi(x)=e^{x}$ | 无 | **平移不变**：整体加上常数 $c$，$P$ 不变（即 Plackett-Luce 模型） |
+
+**③ Top-k 概率**
+
+前 $k$ 个位置恰好是某个候选集合 $G_k$（不计内部顺序）的概率：
+
+$$
+P_s(G_k) = \sum_{\pi:\,\{\pi(1),\dots,\pi(k)\}=G_k} P_s(\pi)
+$$
+
+即对所有"前 $k$ 位恰好是 $G_k$ 的排列"的概率求和。注意这里要对 $k!$ 种内部顺序求和，计算代价约 $O(n!/(n-k)!)$，$k$ 稍大就不可行。$k=1$ 时退化为 **top-one 概率**（用指数函数时就是 softmax）：
+
+$$
+P_s(i) = \frac{\varphi(s_i)}{\sum_{j=1}^{n}\varphi(s_j)}
+\qquad \text{指数形式: }\; P_s(i) = \frac{e^{s_i}}{\sum_j e^{s_j}}
+$$
+
+**④ ListNet 损失（top-one + 指数函数）与梯度推导**
+
+论文实际使用的损失是**预测 top-one 分布与标签 top-one 分布的交叉熵**：
+
+$$
+L(\hat{s}, y) = - \sum_{i=1}^{n} P_y(i)\,\log P_{\hat{s}}(i),
+\qquad
+P_y(i) = \frac{e^{y_i}}{\sum_j e^{y_j}},\quad
+P_{\hat{s}}(i) = \frac{e^{\hat{s}_i}}{\sum_j e^{\hat{s}_j}}
+$$
+
+（由于标签分布的熵 $H(P_y)$ 与模型无关，最小化交叉熵 $\equiv$ 最小化 KL 散度。）
+
+**梯度推导**（softmax+交叉熵的"优雅抵消"）：
+
+$$
+\log P_{\hat{s}}(j) = \hat{s}_j - \log\Bigl(\textstyle\sum_k e^{\hat{s}_k}\Bigr)
+\quad\Rightarrow\quad
+\frac{\partial \log P_{\hat{s}}(j)}{\partial \hat{s}_i} = \delta_{ij} - P_{\hat{s}}(i)
+$$
+
+其中 $\delta_{ij}$ 为 Kronecker 记号。代入交叉熵求导：
+
+$$
+\frac{\partial L}{\partial \hat{s}_i}
+= - \sum_j P_y(j)\,\bigl(\delta_{ij} - P_{\hat{s}}(i)\bigr)
+= - P_y(i) + P_{\hat{s}}(i)\,\sum_j P_y(j)
+= P_{\hat{s}}(i) - P_y(i)
+$$
+
+（最后一步用到 $\sum_j P_y(j) = 1$。）
+
+**结论：$\dfrac{\partial L}{\partial \hat{s}_i} = P_{\hat{s}}(i) - P_y(i)$** —— 模型概率高于标签概率的 item 梯度为正（要压低分数），低于标签概率的 item 梯度为负（要抬高分数）。梯度把所有 item 的分数一起向"标签概率分布"的方向推，这就是"列表级"优化的本质：**每个 item 的梯度都受到同 query 其他 item 的影响**（因为 softmax 分母共享）。
+
+**⑤ 具体例子**
+
+$n=3$，标签 $y=(2,1,0)$（doc1 最相关），模型打分 $\hat{s}=(1.0,0.5,0.2)$。
+
+| 项 | 计算 | 结果 |
+|---|---|---|
+| $e^{y}$ | $(e^{2},\,e^{1},\,e^{0})=(7.389,\,2.718,\,1.000)$ | $P_y=(0.665,\,0.245,\,0.090)$ |
+| $e^{\hat{s}}$ | $(e^{1.0},\,e^{0.5},\,e^{0.2})=(2.718,\,1.649,\,1.221)$ | $P_{\hat{s}}=(0.486,\,0.295,\,0.219)$ |
+
+$$
+L = -\,[\,0.665\ln 0.486 + 0.245\ln 0.295 + 0.090\ln 0.219\,]
+  = -\,[\,0.665(-0.722) + 0.245(-1.221) + 0.090(-1.518)\,]
+  \approx 0.915
+$$
+
+$$
+\frac{\partial L}{\partial \hat{s}} = P_{\hat{s}} - P_y = (-0.179,\; +0.050,\; +0.129)
+$$
+
+含义：doc1 真实最相关，但模型给的分数让它的概率(0.486)低于标签概率(0.665)，所以梯度为负 → 应提高 doc1 的分数；doc3 应降低。梯度方向完全符合直觉，且三个 item 的梯度通过 softmax 分母耦合在一起。
+
+**⑥ 与"query 内 softmax + 对正样本做 CE"的关系（重点）**
+
+如果 ground-truth 用 **one-hot**（正样本 $P_y=1$，其余 $0$），上面的交叉熵退化为：
+
+$$
+L = - \log P_{\hat{s}}(\text{正样本}) = - \log \mathrm{softmax}\bigl(\hat{s}_{\text{正样本}}\bigr)
+$$
+
+这正是你同事说的做法——"query 内候选打分做 softmax，再对正样本位置做交叉熵"。**它是 ListNet top-one 损失在 one-hot 标签下的特例**，也是工业界最常见的 listwise 简化实现。原论文本身用的 P_y 是"标签的 softmax"（非 one-hot），但在"单正样本 + 其余为 0"的设定下两者非常接近（`exp(1) vs exp(0)=1`，权重 2.72:1），one-hot 是常用简化。
+
+**⑦ 关键性质与局限**
+
+- 复杂度：top-one 版为 **$O(n)$**，优于 pairwise RankNet 的 $O(n^2)$。
+- 与指标的关系：ListNet 损失优化的是"概率分布距离"，与 NDCG 等排序指标只是**松散相关**（论文讨论了在特殊条件如二值标签下才与 NDCG 有更强联系），不直接对齐位置折扣。
+- 局限：① 不区分"排第 1 还是第 2"（无位置折扣）；② 完整排列概率/top-k(k>1) 计算代价高，论文主要用 k=1；③ 对"多个正样本"的处理依赖标签分布的选择。
+
+---
+
 #### 2. ListMLE —— Listwise Approach to Learning to Rank: Theory and Algorithm
 - **链接**：[DOI 10.1145/1390156.1390306](https://doi.org/10.1145/1390156.1390306)（ICML 2008）
 - **作者**：Fen Xia, Tie-Yan Liu, Jue Wang, Wensheng Zhang, Hang Li
-- **核心思想**：与 ListNet 同源但更简洁——直接对**真实排列**做极大似然：`L = -log P(π* | scores)`，P 是 Plackett-Luce 模型（`P(π) = ∏ softmax(scores of remaining)`）。有统计一致性理论保证。
-- **方法**：一次前向得到列表分数，按真实排列序（正样本排在负样本前）依次取 softmax 累乘再取负对数。SGD 优化。Top-1 情形退化为 softmax cross-entropy。
+- **核心思想**：与 ListNet 同源但更简洁——直接对**真实排列**做极大似然：$L = -\log P(\pi^{*} \mid \hat{s})$，$P$ 是 Plackett-Luce 模型（$P(\pi) = \prod_t \mathrm{softmax}(\text{剩余分数})_t$）。有统计一致性理论保证。
+- **方法**：一次前向得到列表分数，按真实排列序（正样本排在负样本前）依次取 softmax 累乘再取负对数。SGD 优化。
 - **与 baseline 结合**：酒店场景"真实排列"由点击/下单定义（点击者排前面）。实现时按 `query_id` 分组，组内按 label 降序排列后计算。**这是本文推荐优先尝试的 listwise 损失之一**：公式简单、数值稳定、理论上可解释。
+
+##### 2.1 详细解析：ListMLE 的原理、公式推导与例子
+
+**① 问题设定**
+
+与 ListNet 相同：一个 query 有 $n$ 个候选，模型打分 $\hat{s}=(\hat{s}_1,\dots,\hat{s}_n)$。区别在于 ground-truth 用一个**排列** $\pi^{*}$ 表示（按相关性从高到低排好的全序）。ListMLE 直接最大化"真实排列在 Plackett-Luce 模型下的似然"，即**负对数似然损失**。
+
+**② Plackett-Luce 排列似然**
+
+$$
+P(\pi^{*} \mid \hat{s})
+= \prod_{t=1}^{n} \frac{\exp\bigl(\hat{s}_{\pi^{*}(t)}\bigr)}{\sum_{j=t}^{n} \exp\bigl(\hat{s}_{\pi^{*}(j)}\bigr)}
+$$
+
+逐项理解：第 $t$ 步在"从第 $t$ 位到末尾的剩余候选"上做 softmax，取当前位（真实排列中第 $t$ 个文档）的概率；$n$ 步概率相乘就是整个排列出现的概率。这就是同事所说"对剩余候选做 softmax"的完整版本——不是只做一步，而是**每一步都对剩余候选 softmax，然后累乘**。
+
+**③ ListMLE 损失与梯度推导**
+
+$$
+L(\hat{s}, \pi^{*})
+= - \log P(\pi^{*} \mid \hat{s})
+= \sum_{t=1}^{n} \Bigl[\, \log\Bigl(\sum_{j=t}^{n} e^{\hat{s}_{\pi^{*}(j)}}\Bigr) - \hat{s}_{\pi^{*}(t)} \Bigr]
+$$
+
+梯度（记 $\mathrm{pos}(i)$ 为 item $i$ 在 $\pi^{*}$ 中的位置）：
+
+$$
+\frac{\partial L}{\partial \hat{s}_i}
+= \sum_{t=1}^{\mathrm{pos}(i)} \frac{e^{\hat{s}_i}}{\sum_{j=t}^{n} e^{\hat{s}_{\pi^{*}(j)}}} - 1
+$$
+
+推导要点：$-\hat{s}_{\pi^{*}(t)}$ 这一项只对 $t = \mathrm{pos}(i)$ 有贡献（系数 $-1$）；$\log\bigl(\sum_{j\ge t} e^{\hat{s}_{\pi^{*}(j)}}\bigr)$ 这一项只要 item $i$ 还在"剩余集合"里（即 $t \le \mathrm{pos}(i)$）就有贡献，贡献为 $e^{\hat{s}_i}/S_t$（其中 $S_t = \sum_{j=t}^{n} e^{\hat{s}_{\pi^{*}(j)}}$ 是后缀和）。
+
+**直观解释**：每个 item $i$ 与"在真实排列中排在它后面的所有 item"竞争。若排在其后的 item 分数逼近它，梯度中正的项变大，模型被迫拉开差距。整个损失与梯度**预计算后缀和 $S_t$ 后可做到 $O(n)$ 复杂度**。
+
+**④ Top-k ListMLE**
+
+只取前 $k$ 步的求和：
+
+$$
+L_{\text{top-}k}(\hat{s}, \pi^{*})
+= \sum_{t=1}^{k} \Bigl[\, \log\Bigl(\sum_{j=t}^{n} e^{\hat{s}_{\pi^{*}(j)}}\Bigr) - \hat{s}_{\pi^{*}(t)} \Bigr]
+$$
+
+含义：只要求前 $k$ 个位置排对，后面的顺序不管。酒店场景可以用 top-$k$（如只关注列表前 10 位）。
+
+**⑤ 具体例子**
+
+$n=3$，真实排列 $\pi^{*}=(1,2,3)$（doc1 > doc2 > doc3，对应标签 $y=(2,1,0)$），模型打分 $\hat{s}=(1.0,0.5,0.2)$。
+
+$$
+P(\pi^{*})
+= \frac{e^{1}}{e^{1}+e^{0.5}+e^{0.2}}
+  \cdot \frac{e^{0.5}}{e^{0.5}+e^{0.2}}
+  \cdot \frac{e^{0.2}}{e^{0.2}}
+= \frac{2.718}{5.588} \cdot \frac{1.649}{2.870} \cdot 1
+= 0.486 \times 0.574 \times 1
+= 0.279
+$$
+
+$$
+L = -\ln(0.279) \approx 1.275
+$$
+
+| item | 梯度 $\partial L/\partial \hat{s}_i$ | 方向 |
+|------|-------------------------------------|------|
+| doc1（pos=1） | $\frac{e^{1}}{5.588} - 1 = 0.486 - 1 = -0.514$ | 应升分 |
+| doc2（pos=2） | $\frac{e^{0.5}}{5.588} + \frac{e^{0.5}}{2.870} - 1 = 0.295 + 0.574 - 1 = -0.131$ | 应升分 |
+| doc3（pos=3） | $\frac{e^{0.2}}{5.588} + \frac{e^{0.2}}{2.870} + \frac{e^{0.2}}{1.221} - 1 = 0.219 + 0.426 + 1.0 - 1 = +0.645$ | 应降分 |
+
+注意 doc3 的梯度里含 **3 个 softmax 项**（在 t=1、2、3 三步都参与了竞争），这正是 ListMLE 与"单步 softmax CE"的关键差别。
+
+**⑥ 与"query 内 softmax + 对正样本做 CE"的关系（重点，需辨析）**
+
+- 若只取**第一步**（$t=1$ 的 top-1 ListMLE，即只要求第 1 位是正样本），损失就是 $-\log \dfrac{e^{\hat{s}_{\text{正}}}}{\sum e^{\hat{s}}} = -\log \mathrm{softmax}(\hat{s}_{\text{正}})$ —— 恰好等于同事说的"query 内 softmax + 对正样本做 CE"。
+- 但**完整 ListMLE 是 n 步 softmax 的累乘**，不只考虑正样本：负样本之间的相对顺序也会贡献损失（见上面 doc3 梯度的 3 个项）。
+- 这意味着完整 ListMLE 要求 ground-truth 是**全序**。若标签只有"正/负"二值（部分序），需要额外约定负样本内部顺序（按展示位置 / 随机），否则同样的正负标签会对应不同损失值。**这正是工业界更常用"单正样本 top-one CE"（ListNet one-hot 版）而非完整 ListMLE 的实践原因。** 在 baseline 落地时，若 query 内有多个点击/下单，建议用 top-k ListMLE 或先只取单正样本做 top-one。
+
+**⑦ 关键性质与局限**
+
+- **凸性**：损失在打分向量 $\hat{s}$ 上是凸的（$-\log\sum e^{\hat{s}}$ 是凸的，线性项不破坏凸性）；线性打分模型下在参数 $w$ 上也是凸的 → 可保证收敛到全局最优。
+- **一致性**：论文给出 listwise 损失"一致性（consistency）"的充分条件，并证明 ListMLE 是 sound + consistent 的（样本无穷时收敛到最优排序；对 NDCG、AP 有一致性分析）。这是相对 ListNet 的主要理论贡献。
+- **局限**：ListMLE 优化的是"排列似然"，与 NDCG/GAUC 等**业务指标不直接对应**（部分综述认为其与指标"脱钩"）；实践中常与 ApproxNDCG/LambdaLoss 等"指标对齐损失"搭配使用。对部分序（多正样本、同分）敏感，需要额外约定。**注意：原文中没有"Top-1 情形退化为 softmax cross-entropy"这一说法——退化为单步 softmax 的只是"只取第一位的 top-1 版本"，这是本文档为便于落地做的解读，不要与原文混淆。**
 
 #### 3. SoftRank —— SoftRank: Optimizing Non-Smooth Rank Metrics
 - **链接**：[DOI 10.1145/1341531.1341544](https://doi.org/10.1145/1341531.1341544)（WSDM 2008）
