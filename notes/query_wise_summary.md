@@ -504,14 +504,15 @@ $$
 query_id = tf.fill([self.config.parm.items_per_request], tf.cast(request_id, tf.int64))
 ```
 
-- `request_id` 是 `build_dataset` 里 `tf.data.Dataset.enumerate()` 生成的递增下标：第 0 个请求 → 0、第 1 个请求 → 1、……（每步 `batch_size` 个请求、`drop_remainder=True`，所以范围恰好是 `0..batch_size-1`）。
+- `request_id` 是 `build_dataset` 里 `tf.data.Dataset.enumerate()` 生成的递增下标：第 0 个请求 → 0、第 1 个请求 → 1、……
+- **重要（训练踩坑点）**：`enumerate()` 是对**整个数据流**全局计数。在 `train_eval` 混合数据集下，`request_id` 会一直递增到几十万甚至更大，**并不是**每 batch 从 0 重新计数的 `0..batch_size-1`。因此 ListNet 分组时**不能假设 `query_id` 落在 `[0, batch_size)`**，必须用 `tf.unique` 压缩（见 ⑨.5）。
 - `tf.fill([M], value)` 生成一个长度为 $M$、**所有元素都等于 `value`** 的张量。因此一个请求展开的 $M$ 个位置（真实 item + padding）全部拿到同一个 `request_id`。
 - `build_model` 里 flatten 成 `[BM, 1]`（request-major：全局下标 = $r \times M + i$），再经 `boolean_mask` 后，每个有效 item 仍带着自己的 query_id → 这就是 ListNet 按 query 分组的依据。
 
 示例（$batch\_size=2,\ M=3$）：
 
 $$
-\text{enumerate} \Rightarrow \text{request\_id}=0,1
+\text{enumerate} \Rightarrow \text{request_id}=0,1
 \Rightarrow
 \begin{bmatrix} 0&0&0 \\ 1&1&1 \end{bmatrix}
 \xrightarrow{\text{flatten}}
@@ -531,19 +532,21 @@ tf.unsorted_segment_sum(data, segment_ids, num_segments)
 
 名字里的 **unsorted** 表示不要求 `segment_ids` 有序（`boolean_mask` 之后 item 顺序是乱的，正好需要这个）。它是在"一维展平 + 每元素一个组 id"的形态下，把数据重新聚合成 `[num_q]` 组级向量的标准做法：
 
+实际代码里 segment_ids 用的是 **`qid_compact`**（由 `tf.unique(query_id)` 压缩后的 `0..K-1`，见 ⑨.5），`num_q` 是实际出现的 query 数：
+
 | 代码 | 数学含义 |
 |------|---------|
-| `tf.unsorted_segment_max(logits, qid_1d, num_q)` | $M_q = \max_{j\in q} s_j$，每组最大 logit |
-| `tf.unsorted_segment_sum(exp_shifted, qid_1d, num_q)` | $Z_q = \sum_{j\in q} e^{\,s_j - M_q}$，每组 softmax 分母 |
-| `tf.unsorted_segment_sum(label, qid_1d, num_q)` | $k_q = \sum_{j\in q} \mathbb{1}[y_j{=}1]$，每组正样本数 |
-| `tf.unsorted_segment_sum(pos_loss, qid_1d, num_q)` | 每组正样本的损失和 |
+| `tf.unsorted_segment_max(logits, qid_compact, num_q)` | $M_q = \max_{j\in q} s_j$，每组最大 logit |
+| `tf.unsorted_segment_sum(exp_shifted, qid_compact, num_q)` | $Z_q = \sum_{j\in q} e^{\,s_j - M_q}$，每组 softmax 分母 |
+| `tf.unsorted_segment_sum(label, qid_compact, num_q)` | $k_q = \sum_{j\in q} \mathbb{1}[y_j{=}1]$，每组正样本数 |
+| `tf.unsorted_segment_sum(pos_loss, qid_compact, num_q)` | 每组正样本的损失和 |
 
-示例（7 个 item、3 个 query）：
+示例（7 个 item、3 个 query，`qid_compact` 已压缩）：
 
 ```
-qid_1d  = [0,0,0, 1,1, 2,2]
-label   = [1,0,0, 0,1, 0,0]
-pos_cnt = tf.unsorted_segment_sum(label, qid_1d, 3) = [1, 1, 0]
+qid_compact = [0,0,0, 1,1, 2,2]
+label       = [1,0,0, 0,1, 0,0]
+pos_cnt = tf.unsorted_segment_sum(label, qid_compact, 3) = [1, 1, 0]
 ```
 
 **⑨.3 数值稳定的 log-softmax（为什么先减 max）**
@@ -568,11 +571,13 @@ $$
 
 | 代码 | 公式 |
 |------|------|
-| `max_logit = tf.unsorted_segment_max(logits, qid_1d, num_q)` | $M_q = \max_{j\in q} s_j$ |
-| `shifted = logits - tf.gather(max_logit, qid_1d)` | $t_i = s_i - M_{q(i)} \le 0$ |
+| `max_logit = tf.unsorted_segment_max(logits, qid_compact, num_q)` | $M_q = \max_{j\in q} s_j$ |
+| `shifted = logits - tf.gather(max_logit, qid_compact)` | $t_i = s_i - M_{q(i)} \le 0$ |
 | `exp_shifted = tf.exp(shifted)` | $u_i = e^{t_i} \in (0,\,1]$，不会溢出 |
-| `denom = tf.unsorted_segment_sum(exp_shifted, qid_1d, num_q)` | $Z_q = \sum_{j\in q} e^{\,s_j - M_q}$ |
-| `log_softmax = shifted - tf.log(denom)` | $\log \mathrm{softmax}(s)_i = t_i - \log Z_{q(i)}$ |
+| `denom = tf.unsorted_segment_sum(exp_shifted, qid_compact, num_q)` | $Z_q = \sum_{j\in q} e^{\,s_j - M_q}$ |
+| `log_softmax = shifted - tf.log(tf.gather(denom, qid_compact))` | $\log \mathrm{softmax}(s)_i = t_i - \log Z_{q(i)}$ |
+
+**注意最后一行**：`denom` 是 per-query 的 `[K]`，必须先 `tf.gather` 展开回 per-item 维度（`[B_valid]`）再与 `shifted` 相减。若直接写 `shifted - tf.log(denom)`，`[B_valid] - [K]` shape 不匹配，会报 `Select ... Input 0: [2076] != input 1: [64]` 之类的错。
 
 数值例子（$s=(1.0,0.5,0.2)$）：$M_q=1.0$，$t=(0,-0.5,-0.8)$，$Z=1+0.6065+0.4493=2.0558$，于是 $\log\mathrm{softmax}(s_1) = 0 - \log 2.0558 = -0.721$ ✓（与 $\log\frac{e^{1}}{e^{1}+e^{0.5}+e^{0.2}} = -0.721$ 一致）。
 
@@ -605,6 +610,63 @@ $$
 | 适用场景 | 只要"被点击/下单的都在没点过的前面"即可 | 正样本内部也要分先后（如下单 > 点击） |
 
 > 若需要正样本内部排序，也可以选 **ApproxNDCG**（按 relevance 累加、带位置折扣），比 ListMLE 更贴合酒店排序目标。
+
+**⑨.5 修复后的完整实现（train_eval 下 query_id 是全局大数）**
+
+训练中实际遇到的报错：
+
+```
+Invalid argument: Inputs to operation Select ... must have the same size and shape. Input 0: [2076] != input 1: [64]
+```
+
+两个根因（均已修复）：
+
+1. **`num_q = batch_size` 假设错误**：`enumerate()` 对整个数据流计数，在 `train_eval` 混合数据集下 `query_id` 是几十万的大数，远超 `batch_size=64`。`tf.unsorted_segment_*` / `tf.gather` 遇到越界 segment id 直接报错。修复：`tf.unique` 把实际出现的 `query_id` 压缩成 `0..K-1`。
+2. **`log_softmax = shifted - tf.log(denom)` 广播错误**：`shifted` 是 per-item `[B_valid]`，`denom` 是 per-query `[K]`，直接相减 shape 不匹配（这正是 `Select ... [2076] != [64]` 的来源）。修复：`tf.gather(denom, qid_compact)` 展开回 per-item 维度。
+
+修复后的核心代码：
+
+```python
+if getattr(self.config.parm, 'query_wise_mode', False):
+    qid_1d = tf.reshape(query_id, [-1])                        # [B_valid]
+    # query_id 来自 enumerate() 对整个数据流的全局计数,
+    # train_eval 混合数据集下并不限定在 [0, batch_size)。
+    unique_qid, qid_compact = tf.unique(qid_1d)                # qid_compact ∈ [0, K)
+    num_q = tf.size(unique_qid)                                # 实际出现的 query 数
+
+    def _build_listnet_loss(logits, label, name):
+        logits = tf.reshape(logits, [-1])                      # [B_valid]
+        label = tf.reshape(tf.cast(label, tf.float32), [-1])   # [B_valid] 0/1
+        max_logit = tf.unsorted_segment_max(
+            logits, qid_compact, num_segments=num_q)           # [K]
+        shifted = logits - tf.gather(max_logit, qid_compact)   # [B_valid]
+        exp_shifted = tf.exp(shifted)
+        denom = tf.unsorted_segment_sum(
+            exp_shifted, qid_compact, num_segments=num_q)      # [K]
+        # denom 是 per-query 的 [K], 必须 gather 回 per-item 再减
+        log_softmax = shifted - tf.log(tf.gather(denom, qid_compact))  # [B_valid]
+        pos_loss = -label * log_softmax                        # 仅正样本贡献
+        pos_cnt = tf.unsorted_segment_sum(
+            label, qid_compact, num_segments=num_q)            # [K]
+        pos_sum = tf.unsorted_segment_sum(
+            pos_loss, qid_compact, num_segments=num_q)         # [K]
+        per_query = tf.where(
+            pos_cnt > 0,
+            pos_sum / tf.maximum(pos_cnt, 1.0),
+            tf.zeros_like(pos_cnt))                            # [K]
+        valid_cnt = tf.reduce_sum(tf.cast(pos_cnt > 0, tf.float32))
+        loss = tf.reduce_sum(per_query) / tf.maximum(valid_cnt, 1.0)
+        tf.summary.scalar('listnet_loss/' + name, loss)
+        return loss
+
+    listnet_loss_click = _build_listnet_loss(mlp_out_list[0], labels[0], 'click')
+    listnet_loss_cr = _build_listnet_loss(mlp_out_list[2], labels[1], 'cr')
+    self.loss_ops = [loss_op_click, loss_op_cr, loss_op_dr, loss_op_cvr,
+                     self.config.parm.listnet_w_click * listnet_loss_click,
+                     self.config.parm.listnet_w_cr * listnet_loss_cr]
+```
+
+要点：`qid_compact` 保证 segment id 总是 `0..K-1` 的紧凑整数（同一 query 的 item 映射到同一个值），无论 `query_id` 本身多大；`denom` 用 `tf.gather` 展开回 per-item 维度，`log_softmax` 的 shape 恒为 `[B_valid]`。
 
 ---
 
@@ -712,6 +774,207 @@ $$
 - **方法**：`rank(i) ≈ 1 + Σ_j sigmoid(-(s_i - s_j))`，代入 NDCG 公式得到可导 surrogate。
 - **与 baseline 结合**：**本文最推荐优先实现的损失**。只需要 baseline 的列表内分数 + label，公式现成（见 5.2 节），纯模型侧改动，无需改数据。与 GAUC/NDCG 评价目标最对齐。
 
+##### 4.1 详细解析：ApproxNDCG 的原理、公式推导与例子
+
+**① 目标：NDCG 指标（为什么不可导）**
+
+对一个 query 的 $n$ 个 item，按模型打分 $s$ 降序排列。位置 $i$（从 1 开始）的 item 增益为 $2^{\text{rel}_i}-1$（binary relevance 下正样本=1、负样本=0），按位置折扣 $\log_2(i+1)$ 累加：
+
+$$
+\text{DCG} = \sum_{i=1}^{n} \frac{2^{\text{rel}_i}-1}{\log_2(i+1)},
+\qquad
+\text{NDCG} = \frac{\text{DCG}}{\text{IDCG}}
+$$
+
+$\text{IDCG}$ 是最理想排序（relevance 降序）下的 DCG，是常数。NDCG $\in (0,1]$，越大越好。
+
+**问题**：DCG 依赖 item 的**实际排序位置 $i$**，而排序是"非连续"操作——分数微小变化可能让位置整位跳变，所以 DCG 对分数 $s$ 的梯度处处为 0 或不存在。这正是 pointwise 损失（BCE）与 NDCG 脱节的原因。
+
+**② 核心思路：把 rank 平滑化**
+
+ApproxNDCG 的关键：item $i$ 的排序位置 = "分数比 $s_i$ 高的 item 数 + 1"：
+
+$$
+\text{rank}(i) = 1 + \sum_{j \neq i} \mathbb{I}[s_j > s_i]
+$$
+
+其中 $\mathbb{I}[\cdot]$ 是阶跃指示函数（不可导）。用 **sigmoid** 平滑近似"$j$ 排在 $i$ 前面"：
+
+$$
+\mathbb{I}[s_j > s_i] \;\approx\; \sigma(s_j - s_i) = \frac{1}{1+e^{-(s_j - s_i)}}
+$$
+
+于是得到**平滑 rank**：
+
+$$
+\widehat{\text{rank}}(i) = 1 + \sum_{j \neq i} \sigma(s_j - s_i)
+$$
+
+- 当 $s_j \gg s_i$ 时 $\sigma \to 1$（j 确实排在 i 前，贡献 1）；
+- 当 $s_j \ll s_i$ 时 $\sigma \to 0$（j 排在 i 后，不贡献）；
+- 它处处可导，且随分数连续变化。
+
+**③ ApproxNDCG 损失**
+
+把平滑 rank 代入 DCG，得到可导的 $\widehat{\text{DCG}}$：
+
+$$
+\widehat{\text{DCG}} = \sum_{i=1}^{n} \frac{2^{\text{rel}_i}-1}{\log_2\bigl(\widehat{\text{rank}}(i)+1\bigr)},
+\qquad
+\widehat{\text{NDCG}} = \frac{\widehat{\text{DCG}}}{\text{IDCG}}
+$$
+
+训练时最小化 `1 - NDCG`（或 `-log NDCG`）。由于 IDCG 是常数，梯度只通过 $\widehat{\text{rank}}(i)$ 流动——每个 item 的梯度会"拉着分数比自己高的正样本往下、分数比自己低的正样本往上"，从而把正样本整体往列表前面推。
+
+**④ 具体例子（one-hot 多正样本）**
+
+query 内 4 个 item：A、B 是正样本（rel=1），C、D 是负样本（rel=0）。
+
+| 情况 | 打分 $s=(s_A,s_B,s_C,s_D)$ | 真实排序 | NDCG |
+|---|---|---|---|
+| ① 全部正样本靠前 | $(1.0,\,0.9,\,0.0,\,0.0)$ | A B C D | **1.0** |
+| ② B 掉到第 3 | $(1.0,\,0.0,\,0.9,\,0.0)$ | A C B D | **0.920** |
+
+情况① DCG：$1/\log_2 2 + 1/\log_2 3 + 0 + 0 = 1 + 0.631 = 1.631$，IDCG 同为 1.631，NDCG = 1.0。
+情况② DCG：$1/\log_2 2 + 0/\log_2 3 + 1/\log_2 4 + 0 = 1 + 0.5 = 1.5$，NDCG = $1.5/1.631 = 0.920$。
+
+**注意**：两个正样本等价（rel 都是 1），但 NDCG 仍然"奖励 B 往前挪"——B 从位置 3 提到位置 2 的边际收益 $= 1/\log_2 3 - 1/\log_2 4 = 0.631 - 0.5 = 0.131$。这就是位置折扣的作用：**不要求正样本内部有顺序，但任何正样本越靠前越好**。
+
+平滑 rank 示例（情况①，用 $\sigma(s_j - s_i)$ 近似）：
+
+| item | 真实 rank | $\widehat{\text{rank}}$ | 贡献 |
+|---|---|---|---|
+| A | 1 | $1+\sigma(-0.1)+\sigma(-1)+\sigma(-1)=1+0.475+0.269+0.269=2.013$ | $1/\log_2 3.013 = 0.628$ |
+| B | 2 | $1+\sigma(0.1)+\sigma(-0.9)+\sigma(-0.9)=1+0.525+0.289+0.289=2.103$ | $1/\log_2 3.103 = 0.612$ |
+| C | 3 | $1+\sigma(1)+\sigma(0.9)+\sigma(0)=1+0.731+0.711+0.5=2.942$ | 0（负样本） |
+| D | 4 | 同 C | 0 |
+
+平滑 NDCG ≈ $(0.628+0.612)/1.631 = 0.760$（比真实 1.0 略低，因为平滑 rank 偏大，但**可导且随排序单调**——这正是 surrogate 的意义）。
+
+**⑤ 与 one-hot 多正样本的关系（为什么它比 ListNet/ListMLE 更贴合）**
+
+- **不需要正样本内部顺序**：ApproxNDCG 只用每个 item 的 rel 分数（1/0），不需要构造全排列；
+- **天然处理多正样本**：所有正样本的增益各自按位置折扣累加，"任意正样本往前"都被奖励；
+- **无 ListNet 的"均分反作用"**：ListNet 多正样本时把每个正样本概率推向 $1/k$，强正样本本来 0.6 也会被压回 0.5；ApproxNDCG 的梯度正比于位置折扣差异，只会继续把正样本往前推；
+- **直接对齐排序指标**：优化的就是 NDCG 本身。
+
+**⑥ 与 ListMLE 的对比（one-hot 场景）**
+
+| | ListMLE | ApproxNDCG |
+|---|---|---|
+| 需要正样本内部顺序吗 | **需要**（要补全排列 $\pi^{*}$） | **不需要**（只用 rel 分数） |
+| one-hot 多正样本 | 得硬造负样本序，可能学入位置偏差 | 增益按位置累加，天然处理 |
+| 与酒店排序目标 | 优化"排列似然"，与 NDCG 脱钩 | **直接优化 NDCG** |
+| 位置折扣 | 无（top-k 只近似） | 有（前位权重更大） |
+| 多正样本均分反作用 | 无（但有顺序假设） | 无 |
+
+> 一句话：one-hot 标签下，ListMLE 多出来的 n-1 步 softmax 学的是你硬造的负样本序；ApproxNDCG 则直接把"所有正样本尽量靠前"变成可导目标，与 GAUC/NDCG 对齐程度最高。
+
+##### 4.2 baseline 中的 ApproxNDCG 代码实现：每一行与数学公式的对应
+
+> 对应实验目录 `zxhtl_seq_v2_5_nosid_topnsp_qw_approxndcg_auxloss_meanpool_M3oE_f_idgate_300` 中 `build_model` 里的 `_build_approxndcg_loss`。
+
+**数学公式回顾**（详见 4.1）：
+
+$$
+\widehat{\text{rank}}(i) = 1 + \sum_{j\neq i}\sigma(s_j - s_i)
+\quad\Rightarrow\quad
+\widehat{\text{DCG}} = \sum_{i} \frac{2^{\text{rel}_i}-1}{\log_2\bigl(\widehat{\text{rank}}(i)+1\bigr)},
+\quad
+\text{loss} = 1 - \frac{\widehat{\text{DCG}}}{\text{IDCG}}
+$$
+
+**核心代码**（已带 shape 注释；`B_valid` = 一个 step 内有效 item 数，`K` = 实际出现的 query 数）：
+
+```python
+if getattr(self.config.parm, 'query_wise_mode', False):
+    qid_1d = tf.reshape(query_id, [-1])                        # [B_valid]
+    # query_id 来自 enumerate() 对整个数据流的全局计数, train_eval 下不限定在 [0, batch_size)。
+    unique_qid, qid_compact = tf.unique(qid_1d)                # qid_compact ∈ [0, K)
+    num_q = tf.size(unique_qid)                                # 实际出现的 query 数
+
+    def _build_approxndcg_loss(logits, label, name):
+        s = tf.reshape(logits, [-1])                           # [B_valid]
+        rel = tf.reshape(tf.cast(label, tf.float32), [-1])     # [B_valid] 0/1
+
+        # ---- 1. 平滑 rank ----
+        diff = s[:, None] - s[None, :]                         # [B_valid, B_valid], diff[i,j]=s_i-s_j
+        sig = tf.sigmoid(-diff)                                # [B_valid, B_valid], σ(s_j - s_i)
+        pair_mask = tf.cast(                                   # [B_valid, B_valid], 同 query 才为 1
+            tf.equal(qid_compact[:, None], qid_compact[None, :]), tf.float32)
+        sig = sig * pair_mask
+        rank_hat = 0.5 + tf.reduce_sum(sig, axis=1)            # [B_valid], 1+Σ_{j≠i}σ = 0.5+Σ_j σ
+
+        # ---- 2. DCG surrogate ----
+        gain = tf.pow(2.0, rel) - 1.0                          # [B_valid], 0/1 标签下 = rel
+        # TF1 无 tf.log2, 用换底公式: log2(x) = ln(x)/ln(2)
+        dcg_contrib = gain / (tf.log(rank_hat + 1.0) / tf.log(2.0))  # [B_valid]
+        dcg = tf.unsorted_segment_sum(                         # [K]
+            dcg_contrib, qid_compact, num_segments=num_q)
+
+        # ---- 3. IDCG: 只依赖每个 query 的正样本数 ----
+        pos_cnt = tf.unsorted_segment_sum(                     # [K]
+            rel, qid_compact, num_segments=num_q)
+        pos_cnt_int = tf.cast(pos_cnt, tf.int32)               # [K]
+        max_pos = tf.reduce_max(pos_cnt_int)                   # 本 batch 单 query 最多正样本数
+        positions = tf.cast(tf.range(1, max_pos + 1), tf.float32)  # [max_pos]
+        disc = 1.0 / (tf.log(positions + 1.0) / tf.log(2.0))   # [max_pos], 1/log2(i+1)
+        pos_mask = tf.range(max_pos)[None, :] < pos_cnt_int[:, None]  # [K, max_pos]
+        idcg = tf.reduce_sum(tf.where(                         # [K]
+            pos_mask, tf.broadcast_to(disc, [num_q, max_pos]),
+            tf.zeros([num_q, max_pos], tf.float32)), axis=1)
+
+        # ---- 4. NDCG 与损失 ----
+        ndcg = dcg / tf.maximum(idcg, 1e-8)                    # [K]
+        per_query = tf.where(pos_cnt > 0, 1.0 - ndcg,          # [K], 无正样本 query 不计入
+                             tf.zeros_like(pos_cnt))
+        valid_cnt = tf.reduce_sum(tf.cast(pos_cnt > 0, tf.float32))
+        loss = tf.reduce_sum(per_query) / tf.maximum(valid_cnt, 1.0)
+        tf.summary.scalar('approxndcg_loss/' + name, loss)
+        return loss
+
+    approxndcg_loss_click = _build_approxndcg_loss(mlp_out_list[0], labels[0], 'click')
+    approxndcg_loss_cr = _build_approxndcg_loss(mlp_out_list[2], labels[1], 'cr')
+    self.loss_ops = [loss_op_click, loss_op_cr, loss_op_dr, loss_op_cvr,
+                     self.config.parm.approxndcg_w_click * approxndcg_loss_click,
+                     self.config.parm.approxndcg_w_cr * approxndcg_loss_cr]
+```
+
+**变量 shape 变化一览**：
+
+| 步骤 | 代码 | shape |
+|------|------|-------|
+| 输入分数 | `s = reshape(logits)` | `[B_valid]` |
+| pairwise 分数差 | `diff = s[:,None] - s[None,:]` | `[B_valid, B_valid]` |
+| 平滑指示函数 | `sig = sigmoid(-diff)` | `[B_valid, B_valid]` |
+| query 内 mask | `sig = sig * pair_mask` | `[B_valid, B_valid]` |
+| 平滑 rank | `rank_hat = 0.5 + reduce_sum(sig, axis=1)` | `[B_valid]` |
+| 增益 | `gain = 2^rel - 1` | `[B_valid]` |
+| DCG 贡献 | `dcg_contrib = gain / log2(rank_hat+1)` | `[B_valid]` |
+| DCG | `dcg = unsorted_segment_sum(dcg_contrib, qid_compact, K)` | `[K]` |
+| 正样本数 | `pos_cnt = unsorted_segment_sum(rel, qid_compact, K)` | `[K]` |
+| 理想位置折扣 | `disc = 1/log2(positions+1)` | `[max_pos]` |
+| IDCG | `idcg = reduce_sum(where(pos_mask, broadcast(disc), 0), axis=1)` | `[K]` |
+| NDCG / loss | `ndcg = dcg/max(idcg,eps)`，`per_query = where(pos_cnt>0, 1-ndcg, 0)` | `[K]` |
+
+**与 ListNet 实现的对比**：
+
+| | ListNet（⑨ 节实现） | ApproxNDCG（本节实现） |
+|---|---|---|
+| 位置"来源" | softmax 分母（`unsorted_segment_sum` 聚合，O(B_valid)） | pairwise sigmoid 矩阵（O(B_valid²)） |
+| 位置折扣 | 无（只要求正样本概率高） | **有**（`rank_hat` 进入 `log2` 分母） |
+| 多正样本 | 均分概率 $1/k$（有"强正样本被压回"的反作用） | 增益按位置折扣累加，无均分反作用 |
+| 复杂度 | O(B_valid) | O(B_valid²)（pairwise 矩阵，B_valid≈2000-4000 时可接受） |
+| 数值稳定 | 组内减 max 再 softmax | sigmoid 天然稳定，无 exp 溢出 |
+
+**注意事项**：
+
+1. **复杂度**：`[B_valid, B_valid]` 的 pairwise 矩阵，内存 O(B_valid²)。B_valid ≈ 2000-4000 时可接受；若未来列表超长（如召回几百个），应改用 `tf.dynamic_partition` + `tf.map_fn` 按 query 拆成小矩阵。
+2. **pair_mask 必须正确**：rank 求和只在同 query 内，跨 query 的 pair 必须 mask 掉，否则会把其他请求的 item 也算进 rank。
+3. **无正样本的 query**：`pos_cnt = 0` → `IDCG = 0` → 通过 `tf.where(pos_cnt > 0, ...)` 跳过，不贡献梯度。
+4. **平滑 rank 与真实 rank 的关系**：`rank_hat = 0.5 + Σ_j σ(s_j - s_i)` 把"自己对自己"的贡献从 σ(0)=0.5 修正为 1.0，单 item query 时 `rank_hat = 1.0`。
+5. **权重超参**：`model.yaml` 中 `approxndcg_w_click: 0.5`、`approxndcg_w_cr: 0.5`，设 0 即等价于纯 pointwise baseline。
+
 #### 5. LambdaLoss —— The LambdaLoss Framework for Ranking Metric Optimization
 - **链接**：[arXiv:1802.02265](https://arxiv.org/abs/1802.02265)（CIKM 2018）
 - **作者**：Xuanhui Wang, Cheng Li, Nadav Golbandi, Michael Bendersky, Marc Najork
@@ -769,6 +1032,159 @@ $$
 - **核心思想**：用**多头自注意力**堆叠对列表内所有 doc 联合编码，**不注入位置信息**，从而得到排列不变（permutation-invariant）的列表感知打分模型。论证了理想排序模型的两个性质：建模 doc-doc 交互 + 排列不变。
 - **方法**：doc 特征序列 → 多层 self-attention（SetEncoder）→ 逐位置打分。训练可用任何 LTR 损失。
 - **与 baseline 结合**：这是把"列表内 item 交互"塞进 baseline 最自然的结构——在 M3oE 塔前加一个 masked multi-head self-attention over `[B, M, item_repr]`（mask 掉 padding）。相比 PERM/DLCM 更简单（无顺序、无 decoder），且**天然处理了不同请求 item 数不一致**（masked attention）。**本文推荐作为路径 ③ 的首选结构**。
+
+##### 12.1 详细解析：SetRank 的原理、公式推导与例子
+
+**① 为什么需要"排列不变"（动机）**
+
+传统 LTR 的两类打分函数各有缺陷：
+
+- **univariate（逐文档打分）**：$f(x_i)$ 只依赖单个文档，无法建模文档间交互（DLCM 之前的 LTR 主流）；
+- **sequential multivariate（顺序建模）**：$f(x_1, \dots, x_n)$ 显式建模文档间关系（如 DLCM 用 GRU 按输入顺序编码列表），但输出**依赖输入顺序**——同一个文档集合换一种输入顺序，输出的排序就可能不同，这在数学上是"不自洽"的。
+
+SetRank 提出理想排序模型应满足两个性质：**① 能建模 doc-doc 交互**；**② 排列不变（permutation-invariant）**——输入文档的先后顺序不影响最终排序结果。
+
+**② permutation-invariant 与 permutation-equivariant 的精确定义**
+
+设输入文档集合 $X = \{x_1, \dots, x_n\}$，$P$ 是任意置换（对输入做任意重排），函数 $f$ 作用在集合上。
+
+- **排列不变（permutation-invariant）**：输出不随输入顺序改变，即
+
+$$
+f(P \cdot X) = f(X)
+$$
+
+  例如排序模型的输出是一个排列（文档的有序列表），那么无论 $X$ 里的文档以什么顺序输入，模型给出的排序结果必须相同。这是排序任务**最终输出的要求**。
+
+- **排列等变（permutation-equivariant）**：输出随输入"同序重排"，即
+
+$$
+g(P \cdot X) = P \cdot g(X)
+$$
+
+  例如编码器输出每个元素的表示：输入重排，表示也跟着重排，但"哪个元素对应哪个表示"不变。这是**中间表示**的要求。
+
+**关系**：SetRank 的巧妙之处是**"等变编码 + 逐元素打分 = 不变排序"**。SetEncoder 是排列等变的（每个文档得到自己的表示，顺序跟着输入换），打分函数对每个文档的表示独立打分，于是"哪个文档得哪个分"不随输入顺序改变，最终按分数排序的结果就自然排列不变。
+
+**③ SetEncoder：MAB / SAB / ISAB**
+
+SetRank 的编码器来自 Set Transformer，核心是三个模块：
+
+**Multihead Attention Block（MAB）**——两集合 $X, Y$ 之间的注意力，$X$ 作 query、$Y$ 作 key/value：
+
+$$
+\text{MAB}(X, Y) = \text{LayerNorm}\bigl(H + \text{rFF}(H)\bigr),
+\qquad H = \text{Multihead}(X, Y, Y)
+$$
+
+其中 $\text{Multihead}$ 是标准多头注意力：$\text{head}_i = \text{Attention}(XW_i^Q, YW_i^K, YW_i^V)$，$\text{Attention}(Q,K,V) = \mathrm{softmax}\bigl(QK^{\top}/\sqrt{d_k}\bigr)V$；$\text{rFF}$ 是逐位置的前馈网络。
+
+**Set Attention Block（SAB）**——集合内自注意力：
+
+$$
+\text{SAB}(X) = \text{MAB}(X, X)
+$$
+
+所有元素互为 query/key/value，捕获两两交互。复杂度 $O(n^2)$。
+
+**Induced Set Attention Block（ISAB）**——引入 $m$ 个可学习"诱导点"（inducing points）$I_m = [i_1, \dots, i_m]$，降低复杂度到 $O(mn)$：
+
+$$
+\text{ISAB}_m(X) = \text{MAB}\bigl(X,\ \text{MAB}(I_m, X)\bigr)
+$$
+
+即"诱导点先读一遍集合，集合再读诱导点"，相当于对集合做低秩投影。$m \ll n$ 时计算量显著降低。
+
+MAB / SAB / ISAB **都是排列等变的**：输入元素重排，输出元素跟着重排。
+
+**④ SetRank 模型**
+
+1. 把 query 的 $n$ 个文档的特征向量 $\{x_1, \dots, x_n\}$ 作为输入集合；
+2. 过堆叠的 SetEncoder（SAB 或 ISAB 若干层），得到排列等变的表示 $\{h_1, \dots, h_n\}$；
+3. 对每个 $h_i$ 独立打分：$s_i = \sigma(w^{\top} h_i + b)$（或线性层）；
+4. 排序 = 按 $s_i$ 降序排列。
+
+因为第 2 步等变、第 3 步逐元素独立，所以整体是排列不变的。论文给出了 SAB 版与 ISAB 版两种变体，实验用 **attention rank loss**（注意力加权的列表级损失，与 DLCM 同源）训练，在 MSLR-WEB30K 等三个基准上显著超过 RankSVM / LambdaMART 及神经 IR 基线。
+
+**⑤ 具体例子（等变 vs 不变）**
+
+假设 3 个文档，各自有初始特征 $x_A, x_B, x_C$。
+
+- **等变**：输入 $[x_A, x_B, x_C]$ → SetEncoder 输出 $[h_A, h_B, h_C]$；输入重排为 $[x_C, x_A, x_B]$ → 输出 $[h_C, h_A, h_B]$。$h$ 跟着输入同序换位，但"$h_A$ 属于文档 A"始终不变。
+- **不变**：设打分后 $s_A = 0.8, s_B = 0.5, s_C = 0.2$。无论输入是 $[A,B,C]$ 还是 $[C,B,A]$ 还是任意顺序，最终排序都是 $(A, B, C)$。因为每个文档的分数只取决于"它自己的内容 + 其他文档构成的集合"，不取决于它们在输入序列里的先后位置。
+
+**⑥ 针对酒店场景的例子与实现（对应实验 C）**
+
+**业务直觉**：用户在酒店列表页做相对比较——酒店 A 的吸引力受同列表里"价格更低的酒店 B""评分更高的酒店 C"影响，但**不受 A、B、C 在输入张量里的先后顺序影响**。这正是排列不变性想要的：同一批候选酒店，无论内部怎么排，打分结果应当一致。这也和 DLCM（GRU 按列表顺序编码，输出依赖顺序）形成鲜明对比。
+
+**与 baseline 结合的实现**（实验 C 的核心结构，加在 M3oE 塔之前）：
+
+1. 在 `build_model` 中、`boolean_mask` 之前，把 item 表示 reshape 成 `[B, M, D_in]`（`M = items_per_request = 64`，`D_in` 如 `dnn_input` 的维度）；
+2. 加 **masked self-attention**：padding 位置在 softmax 前加 $-\infty$，避免 padding 参与交互：
+
+$$
+\text{Attention}(Q,K,V) = \mathrm{softmax}\!\Bigl(\frac{QK^{\top}}{\sqrt{d_k}} + \mathcal{M}\Bigr)V
+$$
+
+  其中 $\mathcal{M}$ 是 mask 矩阵（padding 位置为 $-\infty$，其余为 0），由 `item_valid_mask` 构造；
+3. **纯 SetRank 版**：不注入位置信息（排列不变）；**位置感知版**：把 `rank` 投影成位置 embedding 加到 item 表示上（对应实验 C 的"位置感知"选项）；
+4. 残差 + LayerNorm，flatten 回 `[BM, D_out]`，再走 `boolean_mask` → M3oE 塔。
+
+**关键代码注意**：
+
+- 手写 masked multi-head attention 可复用 `target_attention_pool_time_aware` 的注意力骨架（`train.py` L692-826），把"序列内 attention"改成"列表内 attention"；
+- 所有注意力在 `[B, M]` 固定 shape 上计算，满足 Horovod 通信约束；
+- 输出维度变化需同步更新 `Config.dense_input_size`；
+- 复杂度：$M=64$ 时 SAB 为 $O(M^2)=4096$，可接受；若未来候选列表更大（如几百个），改用 ISAB 降低复杂度。
+
+**⑦ 训练损失**
+
+论文用 attention rank loss，但 SetRank 是"结构"方法，训练损失可以自由选择：酒店场景建议**叠加现有 pointwise BCE + 列表级损失**（ListMLE / ApproxNDCG，见 #2 / #4），或直接用列表级损失微调。注意力模块本身只负责"让 item 表示互相看见"，不强制特定损失。
+
+##### 12.2 深入理解：为什么 permutation-invariant 是优点？——回答"输入已经是按位次排序的列表，输出与顺序相关不就是 listwise 吗"
+
+这是一个非常关键的疑问，容易把两个"顺序"混为一谈。先厘清概念，再给例子。
+
+**① 有两种"顺序"，只有一种是模型应当依赖的**
+
+| 顺序 | 含义 | 有业务含义吗 | 模型应依赖吗 |
+|---|---|---|---|
+| **输入枚举顺序（permutation）** | 同一批候选在张量里的先后拼接顺序 | **没有**。它由数据加载/分批/截断方式决定，是"伪顺序" | **不应该依赖** → 这就是 permutation-invariant 要消灭的 |
+| **展示位置（position）** | 酒店在列表页实际展示在第几位 | **有**。第 1 位天然点击率高（位置偏差） | **应该显式建模**（如 `rank_oh` / 位置 embedding） |
+
+你的疑问"输入是按实际位次排序后的列表，输出当然可以和顺序相关"——这里说的"顺序"其实是**展示位置**，它确实应该有影响（位置偏差）。但 SetRank 的 permutation-invariant **反对的并不是"使用位置信息"，而是"依赖输入的枚举顺序"**。这两者可以完全解耦：位置信息可以作为**每个 item 的显式特征**（元素属性）传入，而结构本身不依赖"谁在张量里排在前面"。
+
+**② listwise 和"依赖输入顺序"是两回事**
+
+listwise 的定义是：**以整个列表为样本**，用列表级损失/输出整体排序。它完全不要求输入顺序有意义：
+
+- ListMLE 输入一个排列（有序），用 Plackett-Luce 建模——它把输入顺序当成"ground truth 排列"来用；
+- SetRank 输入一个集合（无顺序），用 SetEncoder 建模 item 间交互——它刻意消除输入顺序的影响。
+
+两者都是 listwise。SetRank 是"listwise + 不依赖输入顺序"的形态，强调的是排序问题的**内在对称性**。
+
+**③ 为什么排列不变是优点（4 个理由）**
+
+1. **排序目标的对称性**：NDCG / GAUC 这类指标对候选集合是**天然对称**的——把候选集合任意打乱，指标不变。模型作为这个任务的近似，理应尊重这个对称性。若模型不是排列不变的，它就把"无关的方差"（拼接顺序）当成了预测依据，只会**增加过拟合、降低泛化**。
+2. **避免学到虚假相关**：如果模型依赖输入顺序，训练数据里"排在前面的 item 通常分高"这类**数据加载伪相关**会被模型学进去，但线上拼接顺序完全不同，这个依赖就成了噪声。
+3. **线上线下一致性**：线上打分时，800 个候选可能分批、并行、顺序任意。排列不变保证：**同一个酒店，无论它出现在哪一批、张量里排第几位，打出的分数完全一致**。这对排序系统的稳定性和可调试性至关重要。
+4. **归纳偏置**：排列不变是"正确"对待集合数据的归纳偏置（inductive bias），就像 CNN 对图像的平移不变、RNN 对时间步的顺序依赖——把模型容量用在真正有意义的信号（内容交互）上，而不是浪费在无意义的顺序上。
+
+**④ 具体例子（为什么排列依赖在线上不可接受）**
+
+假设 3 个酒店 A、B、C，真实"相对质量"是 A > B > C。
+
+- **排列不变模型**：输入 $[A,B,C]$ 或 $[C,A,B]$ 或任意顺序，打分都是 $s_A=0.8, s_B=0.5, s_C=0.2$，排序永远是 $(A,B,C)$。
+- **排列依赖模型**（如 GRU 按输入顺序编码，隐含"靠前位置有先验优势"）：输入 $[A,B,C]$ 时 A 拿到"首位置"的隐式加成 → 排序 $A>B>C$；输入 $[C,A,B]$ 时 C 拿到首位置加成 → 可能排序变成 $C>A>B$。**同一批酒店，只是后端拼接顺序变了，线上排序结果就变了**——这是不可接受的。
+
+**⑤ 结合你的代码：当前 query-wise 数据的 item 顺序其实就是按位次排的**
+
+`_parse_tfrd_query_wise` 里 `keep_idx_sorted` 是按 `item_rank` 升序排列的，所以 `[B, M]` 张量里 item 的顺序 ≈ 展示位次。这意味着：
+
+- 如果做 **DLCM / GRU 式**（按输入顺序编码），输入顺序=展示位次，模型确实在"用顺序编码位置"，输出与顺序相关是合理的；
+- 如果做 **SetRank 式**（排列不变），模型不利用这个顺序；若想保留位置偏差，就把 `rank`（或 `rank_oh`）作为**显式特征**传入（baseline 本来就把 `rank_oh` 拼进了 `show_index_processed`）。
+
+**结论**：你的场景下，排列不变不是"不能利用位次"，而是"位次应该作为特征显式传，而不是靠张量拼接顺序隐式带进去"。这样既保留了位置偏差的建模能力，又消除了"同一个候选集合因拼接顺序不同而排序不同"的隐患。这也正是 SetRank 相比 DLCM 的工程优势：**结构上就保证了线上无论怎么分批/拼接，结果稳定一致**。
 
 #### 13. DPIN —— Deep Position-wise Interaction Network for CTR Prediction
 - **链接**：[arXiv:2106.12229](https://arxiv.org/abs/2106.12229)（SIGIR 2019，美团）
