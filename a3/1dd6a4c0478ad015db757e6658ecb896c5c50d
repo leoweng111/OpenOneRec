@@ -1,0 +1,19 @@
+notes/出行数据与资产定价研究报告.md
+  s_62d6aa0674caf7::t_ae1d9f8b61d609 1-377
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.43-trip",
+  "base_commit_sha": "a31dd6a4c0478ad015db757e6658ecb896c5c50d",
+  "prompts": {},
+  "sessions": {
+    "s_62d6aa0674caf7": {
+      "agent_id": {
+        "tool": "chengxiaobang",
+        "id": "s_0jd54g0cfixj",
+        "model": "DeepSeek-V4-Flash-0731"
+      },
+      "human_author": "leoweng111 <1404813015@qq.com>"
+    }
+  }
+}
